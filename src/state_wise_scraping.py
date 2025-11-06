@@ -30,10 +30,18 @@ def process_state(state_data):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f"--user-data-dir={user_data_dir}")  # isolate cache
+    chrome_binary = os.environ.get("CHROME_BINARY")
+    if chrome_binary:
+        options.binary_location = chrome_binary
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()), options=options
-    )
+    # Use a pre-downloaded ChromeDriver path if provided to avoid race conditions
+    driver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if driver_path and os.path.isfile(driver_path) and os.access(driver_path, os.X_OK):
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        # Fallback to Selenium Manager (lets Selenium pick compatible driver/arch)
+        driver = webdriver.Chrome(options=options)
     df_state = df_state.copy()
     df_state["form_name"] = [[] for _ in range(len(df_state))]
     df_state["submission_date"] = pd.NA
@@ -113,7 +121,7 @@ def process_state(state_data):
 
 
 if __name__ == "__main__":
-    form_df = pd.read_csv("../data/to_fetch_states.csv")
+    form_df = pd.read_csv("data/to_fetch_states.csv")
     df = form_df.copy()
 
     # Group data by state
@@ -131,8 +139,14 @@ if __name__ == "__main__":
     # Safe values: 8GB RAM -> 2-3 processes, 16GB RAM -> 4-6 processes
     # Using 4 as a safe default for M1 MacBook Air (works for both 8GB and 16GB models)
     # You can increase to 6 if you have 16GB RAM and want faster processing
-    n_proc = min(cpu_count(), 6, len(state_groups))  # Don't exceed number of states
+    n_proc = min(cpu_count(), 8, len(state_groups))  # Don't exceed number of states
     # For 16GB M1 MacBook Air, you can safely use: n_proc = min(cpu_count(), 6, len(state_groups))
+
+    # Prefer system chromedriver on ARM64 (avoids wrong-arch downloads)
+    for system_path in ("/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver"):
+        if os.path.exists(system_path):
+            os.environ["CHROMEDRIVER_PATH"] = system_path
+            break
 
     print(f"\nUsing {n_proc} processes (CPU cores available: {cpu_count()})")
     print(f"Each process will handle one state and save progress immediately.\n")
