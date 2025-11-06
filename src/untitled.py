@@ -110,9 +110,9 @@ def process_chunk(df_chunk):
 
 
 if __name__ == "__main__":
-    form_df = pd.read_csv("form_data.csv")
+    form_df = pd.read_csv("data/to_fetch_states.csv")
     df = form_df.copy()
-    n_proc = min(cpu_count(), 4)
+    n_proc = min(cpu_count(), 8)
     chunks = np.array_split(df, n_proc)
 
     with Pool(n_proc) as pool:
@@ -121,5 +121,5 @@ if __name__ == "__main__":
     # Combine results
     result_dfs = [pd.read_csv(f) for f in partial_files]
     final_df = pd.concat(result_dfs, ignore_index=True)
-    final_df.to_csv("downloaded_parallel_clean.csv", index=False)
+    final_df.to_csv("data/downloaded_parallel_clean_final.csv", index=False)
     print("✅ All processes done with cache cleared each cycle.")
