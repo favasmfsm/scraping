@@ -73,10 +73,10 @@ ehthumbs.db
 Thumbs.db
 
 data/list_of_form*
-data/states_data_temp/
 
 # Large CSV files (exceed GitHub's 100MB limit)
 data/form_data.csv
 data/full_data.csv
 data/form_data_temp.csv
 
+*.pem
