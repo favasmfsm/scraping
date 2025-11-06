@@ -14,6 +14,7 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from textstat import flesch_reading_ease
 import PyPDF2
+import pdfplumber
 
 BASE_DIR = "downloads"
 
@@ -203,11 +204,10 @@ def process_state(state_data):
                         # Use the actual file path that was found
                         # Extract text
                         try:
-                            with open(actual_file_path, "rb") as f:
-                                reader = PyPDF2.PdfReader(f)
-                                text = " ".join(
-                                    page.extract_text() for page in reader.pages
-                                )
+                            text = ""
+                            with pdfplumber.open(actual_file_path) as pdf:
+                                for page in pdf.pages:
+                                    text += page.extract_text() or ""
                             flesch_score = flesch_reading_ease(text)
                         except Exception as e:
                             flesch_score = None
