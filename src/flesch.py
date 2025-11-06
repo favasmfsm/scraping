@@ -201,7 +201,6 @@ def process_state(state_data):
                         flesch_score = None
                     else:
                         # Use the actual file path that was found
-                        print(f"[PATH] Found file: {actual_file_path}")
                         # Extract text
                         try:
                             with open(actual_file_path, "rb") as f:
@@ -215,10 +214,25 @@ def process_state(state_data):
                             print(f"[ERROR] Failed to process PDF: {str(e)}")
 
                         # delete file
-                        if os.path.exists(actual_file_path):
-                            os.remove(actual_file_path)
+                        try:
+                            if os.path.exists(actual_file_path):
+                                os.remove(actual_file_path)
 
-                    print(f"[SCORE] {form_name}: {flesch_score}")
+                        except Exception as e:
+
+                            # Try to delete again after a short delay (file might be locked)
+                            try:
+                                time.sleep(0.5)
+                                if os.path.exists(actual_file_path):
+                                    os.remove(actual_file_path)
+                                    print(
+                                        f"[DELETE] Successfully deleted on retry: {actual_file_path}"
+                                    )
+                            except Exception as e2:
+                                print(
+                                    f"[ERROR] Failed to delete PDF on retry {actual_file_path}: {str(e2)}"
+                                )
+
                     df_state.at[idx, "flesch_reading_ease"].append(flesch_score)
                 except Exception as e:
                     continue
