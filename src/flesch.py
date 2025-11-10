@@ -11,20 +11,19 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from textstat import flesch_reading_ease
 import PyPDF2
-import pdfplumber
+import fitz  # PyMuPDF
 
 BASE_DIR = "downloads"
 
 
 def process_state(state_data):
     """
-    Process all rows for a single state and save progress immediately.
-    state_data is a tuple: (state_name, df_for_state)
+    Process all rows for a single state chunk and save progress immediately.
+    state_data is a tuple: (state_name, df_for_state, chunk_idx, num_chunks)
     """
-    state_name, df_state = state_data
+    state_name, df_state, chunk_idx, num_chunks = state_data
 
     # Temporary Chrome user data directory for isolated cache
     user_data_dir = tempfile.mkdtemp(prefix="chrome_cache_")
@@ -43,14 +42,32 @@ def process_state(state_data):
             "plugins.always_open_pdf_externally": True,
         },
     )
+    chrome_binary = os.environ.get("CHROME_BINARY")
+    if chrome_binary:
+        options.binary_location = chrome_binary
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()), options=options
-    )
+    # Use a pre-downloaded ChromeDriver path if provided to avoid race conditions
+    driver_path = os.environ.get("CHROMEDRIVER_PATH")
+    if driver_path and os.path.isfile(driver_path) and os.access(driver_path, os.X_OK):
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        # Fallback to Selenium Manager (lets Selenium pick compatible driver/arch)
+        driver = webdriver.Chrome(options=options)
     df_state = df_state.copy()
     df_state["form_name"] = [[] for _ in range(len(df_state))]
     df_state["submission_date"] = pd.NA
     df_state["flesch_reading_ease"] = [[] for _ in range(len(df_state))]
+
+    # Create a single download directory per process (reused for all URLs)
+    download_path = os.path.join(BASE_DIR, f"proc_{os.getpid()}", state_name)
+    download_path = os.path.abspath(download_path)
+    os.makedirs(download_path, exist_ok=True)
+    print(f"[PATH] Download directory: {download_path}")
+    driver.execute_cdp_cmd(
+        "Page.setDownloadBehavior",
+        {"behavior": "allow", "downloadPath": download_path},
+    )
 
     try:
         # Authenticate once for this state
@@ -75,26 +92,14 @@ def process_state(state_data):
         except Exception as e:
             pass
 
-        # Process all URLs for this state
-        for idx, row in tqdm(
-            df_state.iterrows(),
+        # Process all URLs for this state chunk
+        for row in tqdm(
+            df_state.itertuples(),
             total=len(df_state),
-            desc=f"State: {state_name} (PID {os.getpid()})",
+            desc=f"State: {state_name} Chunk {chunk_idx+1}/{num_chunks} (PID {os.getpid()})",
         ):
-            url = row["page_url"]
-            # Dynamic download path - use absolute path
-            folder_name = url.split("=")[-1].strip()
-            download_path = os.path.join(
-                BASE_DIR, f"proc_{os.getpid()}", state_name, folder_name
-            )
-            # Convert to absolute path
-            download_path = os.path.abspath(download_path)
-            print(f"[PATH] Download directory: {download_path}")
-            os.makedirs(download_path, exist_ok=True)
-            driver.execute_cdp_cmd(
-                "Page.setDownloadBehavior",
-                {"behavior": "allow", "downloadPath": download_path},
-            )
+            idx = row.Index
+            url = row.page_url
 
             # Navigate and extract
             driver.get(url)
@@ -202,12 +207,13 @@ def process_state(state_data):
                         flesch_score = None
                     else:
                         # Use the actual file path that was found
-                        # Extract text
+                        # Extract text using PyMuPDF
                         try:
                             text = ""
-                            with pdfplumber.open(actual_file_path) as pdf:
-                                for page in pdf.pages:
-                                    text += page.extract_text() or ""
+                            pdf = fitz.open(actual_file_path)
+                            for page in pdf:
+                                text += page.get_text() or ""
+                            pdf.close()
                             flesch_score = flesch_reading_ease(text)
                         except Exception as e:
                             flesch_score = None
@@ -237,40 +243,78 @@ def process_state(state_data):
                 except Exception as e:
                     continue
 
-            if idx % 5 == 0:
-                checkpoint_file = f"outputs/temp_results_{state_name}_{os.getpid()}.csv"
+            if idx % 200 == 0 and idx > 0:
+                checkpoint_file = f"outputs/temp_results_{state_name}_chunk{chunk_idx+1}_{os.getpid()}.csv"
                 df_state.to_csv(checkpoint_file, index=False)
+                # Clean up cache in /tmp folder on each checkpoint save
+                try:
+                    # Clean up old Chrome cache directories in /tmp
+                    tmp_dir = "/tmp"
+                    if os.path.exists(tmp_dir):
+                        for item in os.listdir(tmp_dir):
+                            item_path = os.path.join(tmp_dir, item)
+                            # Only clean up chrome_cache_ directories that are not the current one
+                            if item.startswith("chrome_cache_") and item_path != user_data_dir:
+                                try:
+                                    if os.path.isdir(item_path):
+                                        shutil.rmtree(item_path, ignore_errors=True)
+                                        print(f"[CLEANUP] Removed old cache directory: {item_path}")
+                                except Exception as e:
+                                    print(f"[CLEANUP] Failed to remove {item_path}: {str(e)}")
+                except Exception as e:
+                    print(f"[CLEANUP] Error during cache cleanup: {str(e)}")
     finally:
         driver.quit()
         shutil.rmtree(user_data_dir, ignore_errors=True)  # clean Chrome cache
+        # Clean up the single download directory for this process
+        try:
+            if os.path.exists(download_path):
+                shutil.rmtree(download_path, ignore_errors=True)
+                print(f"[DELETE] Deleted download directory: {download_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to delete download directory {download_path}: {str(e)}")
 
-    # Save progress for this state immediately
+    # Save progress for this state chunk immediately
     # Sanitize state name for filename (remove special characters)
     safe_state_name = "".join(
         c if c.isalnum() or c in (" ", "-", "_") else "_" for c in state_name
     )
-    partial_file = f"outputs/temp_results_{safe_state_name}_{os.getpid()}.csv"
+    partial_file = f"outputs/temp_results_{safe_state_name}_chunk{chunk_idx+1}_{os.getpid()}.csv"
     df_state.to_csv(partial_file, index=False)
     return partial_file
 
 
 if __name__ == "__main__":
-    form_df = pd.read_csv("data/to_fetch_states.csv")
-    df = form_df.copy()
+    form_df = pd.read_csv("data/form_data_full.csv")
+    to_extract = pd.read_csv("data/to_extract_v2.csv")
+    df = form_df[form_df.serf_num.isin(to_extract.serf_num)]
 
     # Group data by state
     states = df.groupby("state")
-    state_groups = [
-        (state_name, state_df.reset_index(drop=True)) for state_name, state_df in states
-    ]
+    state_groups = []
+    chunk_size = 1000
+    
+    # Split each state into chunks of 1000 rows
+    for state_name, state_df in states:
+        state_df = state_df.reset_index(drop=True)
+        # Split into chunks of 1000 rows
+        num_chunks = (len(state_df) + chunk_size - 1) // chunk_size  # Ceiling division
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, len(state_df))
+            chunk_df = state_df.iloc[start_idx:end_idx].reset_index(drop=True)
+            state_groups.append((state_name, chunk_df, chunk_idx, num_chunks))
+    
+    # Sort by number of rows (largest first)
+    state_groups.sort(key=lambda x: len(x[1]), reverse=True)
 
-    # For M1 MacBook Air: Each Chrome process uses ~1-1.5GB RAM
-    # M1 has 8 CPU cores, but memory is the limiting factor
-    # Safe values: 8GB RAM -> 2-3 processes, 16GB RAM -> 4-6 processes
-    # Using 4 as a safe default for M1 MacBook Air (works for both 8GB and 16GB models)
-    # You can increase to 6 if you have 16GB RAM and want faster processing
-    n_proc = min(cpu_count(), 2, len(state_groups))  # Don't exceed number of states
-    # For 16GB M1 MacBook Air, you can safely use: n_proc = min(cpu_count(), 6, len(state_groups))
+    # Prefer system chromedriver on ARM64 (avoids wrong-arch downloads)
+    for system_path in ("/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver"):
+        if os.path.exists(system_path):
+            os.environ["CHROMEDRIVER_PATH"] = system_path
+            break
+
+    n_proc = min(cpu_count(), 7, len(state_groups))  # Don't exceed number of states
 
     with Pool(n_proc) as pool:
         partial_files = list(pool.map(process_state, state_groups))
