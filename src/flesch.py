@@ -18,6 +18,62 @@ import fitz  # PyMuPDF
 BASE_DIR = "downloads"
 
 
+def cleanup_chrome_cache(current_user_data_dir=None):
+    """
+    Clean up Chrome cache directories from various locations.
+    
+    Args:
+        current_user_data_dir: Path to the current Chrome user data directory to preserve
+    """
+    cleaned_count = 0
+    cleaned_size = 0
+    
+    # Locations where Chrome cache might be stored
+    cache_locations = [
+        "/tmp",  # Direct temp directories
+        "/tmp/snap-private-tmp/snap.chromium/tmp",  # Snap Chrome cache location
+    ]
+    
+    for base_dir in cache_locations:
+        if not os.path.exists(base_dir):
+            continue
+            
+        try:
+            # Look for chrome_cache_* directories
+            for item in os.listdir(base_dir):
+                item_path = os.path.join(base_dir, item)
+                
+                # Skip if this is the current user data directory
+                if current_user_data_dir and item_path == current_user_data_dir:
+                    continue
+                
+                # Check if it's a Chrome cache directory
+                if item.startswith("chrome_cache_") and os.path.isdir(item_path):
+                    try:
+                        # Calculate size before deletion
+                        try:
+                            size = sum(
+                                os.path.getsize(os.path.join(dirpath, filename))
+                                for dirpath, dirnames, filenames in os.walk(item_path)
+                                for filename in filenames
+                            )
+                            cleaned_size += size
+                        except:
+                            pass
+                        
+                        shutil.rmtree(item_path, ignore_errors=True)
+                        cleaned_count += 1
+                        print(f"[CLEANUP] Removed Chrome cache directory: {item_path}")
+                    except Exception as e:
+                        print(f"[CLEANUP] Failed to remove {item_path}: {str(e)}")
+        except Exception as e:
+            print(f"[CLEANUP] Error accessing {base_dir}: {str(e)}")
+    
+    if cleaned_count > 0:
+        size_mb = cleaned_size / (1024 * 1024)
+        print(f"[CLEANUP] Cleaned {cleaned_count} cache directories (~{size_mb:.1f} MB)")
+
+
 def process_state(state_data):
     """
     Process all rows for a single state chunk and save progress immediately.
@@ -246,26 +302,13 @@ def process_state(state_data):
             if idx % 200 == 0 and idx > 0:
                 checkpoint_file = f"outputs/temp_results_{state_name}_chunk{chunk_idx+1}_{os.getpid()}.csv"
                 df_state.to_csv(checkpoint_file, index=False)
-                # Clean up cache in /tmp folder on each checkpoint save
-                try:
-                    # Clean up old Chrome cache directories in /tmp
-                    tmp_dir = "/tmp"
-                    if os.path.exists(tmp_dir):
-                        for item in os.listdir(tmp_dir):
-                            item_path = os.path.join(tmp_dir, item)
-                            # Only clean up chrome_cache_ directories that are not the current one
-                            if item.startswith("chrome_cache_") and item_path != user_data_dir:
-                                try:
-                                    if os.path.isdir(item_path):
-                                        shutil.rmtree(item_path, ignore_errors=True)
-                                        print(f"[CLEANUP] Removed old cache directory: {item_path}")
-                                except Exception as e:
-                                    print(f"[CLEANUP] Failed to remove {item_path}: {str(e)}")
-                except Exception as e:
-                    print(f"[CLEANUP] Error during cache cleanup: {str(e)}")
+                # Clean up old Chrome cache directories on each checkpoint save
+                cleanup_chrome_cache(current_user_data_dir=user_data_dir)
     finally:
         driver.quit()
         shutil.rmtree(user_data_dir, ignore_errors=True)  # clean Chrome cache
+        # Clean up any remaining Chrome cache directories
+        cleanup_chrome_cache(current_user_data_dir=user_data_dir)
         # Clean up the single download directory for this process
         try:
             if os.path.exists(download_path):
