@@ -4,6 +4,18 @@
 
 This document describes a three-phase web scraping and data analysis pipeline designed to extract insurance filing information from the SERFF (System for Electronic Rate and Form Filing) website and compute readability scores for associated PDF documents. The process was executed on a 16-core AWS EC2 instance to leverage parallel processing capabilities.
 
+## Process Summary
+
+The pipeline consists of three sequential phases:
+
+**Phase 1: Data Collection** - Scrapes the SERFF website to extract basic filing information (company names, tracking numbers, filing types) for each state and saves it to CSV files.
+
+**Phase 2: Primary Processing** - Uses the direct page URLs from Phase 1 to download PDF attachments, extract their text content, and calculate readability scores (Flesch Reading Ease) for each document.
+
+**Phase 3: Recovery Processing** - Handles filings that couldn't be processed in Phase 2 by using SERFF tracking numbers to search for and access filing pages, then downloads PDFs and computes readability scores.
+
+Each phase processes data in parallel across multiple states to maximize efficiency. The pipeline includes automatic progress saving, error handling, and resource cleanup to ensure reliable execution.
+
 ---
 
 ## Phase 1: Tabular Data Extraction
