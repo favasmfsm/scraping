@@ -2,10 +2,12 @@ import pandas as pd
 import numpy as np
 import os
 import re
+import random
 import shutil
+import time
 import zipfile
 from urllib.parse import unquote
-from multiprocessing import Pool, cpu_count, Value
+from multiprocessing import Pool, Manager, cpu_count, Value
 from tqdm import tqdm
 import threading
 import fitz  # PyMuPDF
@@ -16,19 +18,30 @@ from browser_utils import (
     restart_browser,
     navigate_via_search,
     is_session_expired,
+    is_server_error,
+    wait_for_server_recovery,
     click_select_buttons,
     wait_for_ajax,
     download_zip,
+    BACKOFF_ON_500,
 )
+
+# Throttle settings — be gentle on the SERFF server
+MIN_DELAY_BETWEEN_ROWS = 2  # minimum seconds between requests
+MAX_DELAY_BETWEEN_ROWS = 5  # maximum seconds between requests
 
 # Shared counter for total-progress tracking across worker processes
 _shared_counter = None
+# Shared set of states whose authentication has permanently failed —
+# other workers skip chunks for these states immediately.
+_failed_states = None
 
 
-def _init_worker(counter):
-    """Pool initializer: store the shared counter in each worker."""
-    global _shared_counter
+def _init_worker(counter, failed_states):
+    """Pool initializer: store shared objects in each worker."""
+    global _shared_counter, _failed_states
     _shared_counter = counter
+    _failed_states = failed_states
 
 
 def _monitor_progress(counter, total, stop_event):
@@ -212,33 +225,43 @@ def extract_readability_text(extract_dir, ignore_folders):
     return readability_texts
 
 
-def build_work_units(df, max_chunk_size=500):
+def build_work_units(df):
     """
-    Split states into chunks so large states can use multiple cores.
-    Returns list of (work_label, state_name, df_chunk) tuples,
-    sorted largest-first for optimal load balancing.
+    Group rows by state — one work unit per state (no chunking).
+    Returns list of (work_label, state_name, df_for_state) tuples,
+    sorted largest-first so big states start processing early.
     """
     units = []
     for state_name, state_df in df.groupby("state"):
         state_df = state_df.reset_index(drop=True)
-        if len(state_df) <= max_chunk_size:
-            units.append((state_name, state_name, state_df))
-        else:
-            for i in range(0, len(state_df), max_chunk_size):
-                chunk = state_df.iloc[i : i + max_chunk_size].reset_index(drop=True)
-                chunk_label = f"{state_name}_chunk{i // max_chunk_size}"
-                units.append((chunk_label, state_name, chunk))
-    # Largest chunks first for better load balancing
+        units.append((state_name, state_name, state_df))
+    # Largest states first for better load balancing
     units.sort(key=lambda x: len(x[2]), reverse=True)
     return units
 
 
-def _try_direct_nav(page, url, idx):
+def _try_direct_nav(page, url, idx, state_name):
     """
     Attempt direct URL navigation. Returns True if we landed on the filing
-    summary page, False otherwise (session expired, redirected, timeout).
+    summary page, False otherwise (session expired, redirected, 500, timeout).
+    Handles 500 errors with backoff retries.
     """
     page.goto(url, wait_until="domcontentloaded")
+
+    # Check for 500 server error first
+    if is_server_error(page):
+        print(
+            f"[500] PID {os.getpid()} row {idx}: Server error on direct nav for {url}"
+        )
+        for err_attempt in range(len(BACKOFF_ON_500)):
+            if wait_for_server_recovery(page, state_name, err_attempt):
+                page.goto(url, wait_until="domcontentloaded")
+                if not is_server_error(page) and "filingSummary" in page.url:
+                    return True
+        print(
+            f"[500] PID {os.getpid()} row {idx}: Server still returning 500 after retries, falling back to search..."
+        )
+        return False
 
     if is_session_expired(page):
         print(
@@ -300,11 +323,18 @@ def _re_navigate(page, context, tracking_number, is_alpha, url, state_name):
 
 def process_state(state_data):
     """
-    Process all rows for one work unit (state or state-chunk) with a single browser.
-    state_data is a tuple: (work_label, state_name, df_for_chunk)
-    The worker owns this chunk end-to-end, checkpointing every 100 rows.
+    Process all rows for one state with a single browser.
+    state_data is a tuple: (work_label, state_name, df_for_state)
+    The worker owns this state end-to-end, checkpointing every 100 rows.
     """
     work_label, state_name, df_state = state_data
+
+    # Fast-skip: another worker already proved this state is unreachable
+    if _failed_states is not None and state_name in _failed_states:
+        print(
+            f"[SKIP] {work_label}: state {state_name} already marked as failed, skipping"
+        )
+        return None
 
     df_state = df_state.copy()
     # Initialize new columns for ZIP-based extraction
@@ -323,9 +353,32 @@ def process_state(state_data):
     pw, browser, context, page = create_browser()
 
     try:
-        # Authenticate once for this state
-        if not authenticate(page, state_name):
-            print(f"[ERROR] Initial authentication failed for state {state_name}")
+        # Authenticate with retries (3 attempts with backoff)
+        AUTH_RETRIES = 3
+        auth_ok = False
+        for attempt in range(1, AUTH_RETRIES + 1):
+            # Check again in case another worker marked it while we were retrying
+            if _failed_states is not None and state_name in _failed_states:
+                print(
+                    f"[SKIP] {work_label}: state {state_name} marked as failed by another worker"
+                )
+                return None
+            auth_ok = authenticate(page, state_name)
+            if auth_ok:
+                break
+            if attempt < AUTH_RETRIES:
+                wait = attempt * 5  # 5s, 10s backoff
+                print(
+                    f"[RETRY] {work_label}: auth attempt {attempt}/{AUTH_RETRIES} failed, retrying in {wait}s..."
+                )
+                time.sleep(wait)
+
+        if not auth_ok:
+            print(
+                f"[ERROR] All {AUTH_RETRIES} auth attempts failed for {work_label} — marking state {state_name} as failed"
+            )
+            if _failed_states is not None:
+                _failed_states[state_name] = True
             return None
 
         # Folders to ignore when processing ZIP contents
@@ -357,7 +410,7 @@ def process_state(state_data):
 
                 # Step A: Try direct URL navigation first (skip for alpha IDs)
                 if not is_alpha:
-                    nav_ok = _try_direct_nav(page, url, idx)
+                    nav_ok = _try_direct_nav(page, url, idx, state_name)
 
                 # Step B: If direct nav failed (or alpha ID), try search-based navigation
                 if not nav_ok:
@@ -369,8 +422,8 @@ def process_state(state_data):
                         )
                         continue
 
-                    # Try search-based nav with fresh browser on failure
-                    for search_attempt in range(2):
+                    # Try search-based nav with fresh browser on failure (3 attempts)
+                    for search_attempt in range(3):
                         if search_attempt == 1:
                             # Second attempt: restart browser first
                             print(
@@ -379,15 +432,40 @@ def process_state(state_data):
                             browser, context, page, _ = restart_browser(
                                 pw, browser, state_name
                             )
+                        elif search_attempt == 2:
+                            # Third attempt: wait longer in case of server overload
+                            print(
+                                f"[WARN] PID {os.getpid()} row {idx}: Search nav failed again, waiting 30s then retrying..."
+                            )
+                            time.sleep(30)
+                            browser, context, page, _ = restart_browser(
+                                pw, browser, state_name
+                            )
 
                         if navigate_via_search(
                             page, context, tracking_number, state_name
                         ):
+                            # Check if search landed on a 500 page
+                            if is_server_error(page):
+                                print(
+                                    f"[500] PID {os.getpid()} row {idx}: Server error after search nav for {tracking_number}"
+                                )
+                                wait_for_server_recovery(
+                                    page, state_name, search_attempt
+                                )
+                                continue
                             nav_ok = True
                             break
-                        print(
-                            f"[WARN] PID {os.getpid()} row {idx}: Search nav attempt {search_attempt + 1}/2 failed for {tracking_number}"
-                        )
+                        # Check if the failure was due to a 500 error
+                        if is_server_error(page):
+                            print(
+                                f"[500] PID {os.getpid()} row {idx}: Server error during search for {tracking_number}, waiting before retry..."
+                            )
+                            wait_for_server_recovery(page, state_name, search_attempt)
+                        else:
+                            print(
+                                f"[WARN] PID {os.getpid()} row {idx}: Search nav attempt {search_attempt + 1}/3 failed for {tracking_number}"
+                            )
 
                     if not nav_ok:
                         print(
@@ -403,6 +481,30 @@ def process_state(state_data):
                 for _page_attempt in range(
                     3
                 ):  # attempt 0 = normal, 1-2 = retry after restart
+
+                    # Check for 500 error AFTER navigation
+                    if is_server_error(page):
+                        print(
+                            f"[500] PID {os.getpid()} row {idx}: Server error before download (attempt {_page_attempt+1}) for {url}"
+                        )
+                        if _page_attempt < 2:
+                            wait_for_server_recovery(page, state_name, _page_attempt)
+                            browser, context, page, _ = restart_browser(
+                                pw, browser, state_name
+                            )
+                            if _re_navigate(
+                                page,
+                                context,
+                                tracking_number,
+                                is_alpha,
+                                url,
+                                state_name,
+                            ):
+                                continue
+                        print(
+                            f"[SKIP] PID {os.getpid()} row {idx}: Server error persists for {url}, skipping"
+                        )
+                        break
 
                     # Check for session expired AFTER navigation
                     if is_session_expired(page):
@@ -600,6 +702,9 @@ def process_state(state_data):
                 if _shared_counter is not None:
                     with _shared_counter.get_lock():
                         _shared_counter.value += 1
+                # Throttle: random delay between rows to avoid hammering the server
+                delay = random.uniform(MIN_DELAY_BETWEEN_ROWS, MAX_DELAY_BETWEEN_ROWS)
+                time.sleep(delay)
 
             # Checkpoint save every 100 rows
             if idx % 100 == 0 and idx > 0:
@@ -698,7 +803,7 @@ def load_already_processed(output_dir="outputs"):
 
 
 if __name__ == "__main__":
-    form_df = pd.read_csv("data/batch_1.csv")
+    form_df = pd.read_csv("data/remaining_batch_b.csv")
     df = form_df.copy()
 
     # ------------------------------------------------------------------
@@ -731,17 +836,17 @@ if __name__ == "__main__":
         )
         exit(0)
 
-    n_proc = min(cpu_count(), 6)  # Use 6 of 8 cores, leave 2 for system + I/O
+    n_proc = 6  # Single process — Playwright + multiprocessing causes EPIPE on macOS
 
-    # Group data by state AND split large states into chunks for parallelism
-    work_units = build_work_units(df, max_chunk_size=500)
+    # Group data by state — one work unit per state, largest first
+    work_units = build_work_units(df)
 
     # ------------------------------------------------------------------
-    # Each core gets one work unit (state or state-chunk) at a time.
-    # Largest chunks are assigned first. When a core finishes, it picks
-    # up the next unassigned unit automatically (via imap_unordered).
+    # Each core gets one state at a time. Largest states start first.
+    # When a core finishes a state, it picks up the next unassigned
+    # state automatically (via imap_unordered).
     # ------------------------------------------------------------------
-    print(f"Processing {len(work_units)} work units with {n_proc} processes")
+    print(f"Processing {len(work_units)} states with {n_proc} processes")
     print(
         f"Total URLs to process: {len(df)} (skipped {original_len - len(df)} already done)"
     )
@@ -753,6 +858,10 @@ if __name__ == "__main__":
 
     # Shared counter for total progress across all workers
     total_counter = Value("i", 0)
+    # Shared dict to track states whose auth permanently failed
+    manager = Manager()
+    failed_states = manager.dict()
+
     stop_event = threading.Event()
     monitor = threading.Thread(
         target=_monitor_progress,
@@ -762,10 +871,10 @@ if __name__ == "__main__":
     monitor.start()
 
     with Pool(
-        actual_procs, initializer=_init_worker, initargs=(total_counter,)
+        actual_procs, initializer=_init_worker, initargs=(total_counter, failed_states)
     ) as pool:
-        # imap_unordered feeds tasks in order (largest states first) and
-        # each worker picks the next state as soon as it finishes one
+        # imap_unordered feeds states (largest first); each worker picks
+        # the next state as soon as it finishes one
         state_result_files = list(pool.imap_unordered(process_state, work_units))
 
     stop_event.set()
@@ -795,5 +904,5 @@ if __name__ == "__main__":
 
     print(
         f"\n✅ All done. Results saved to form_names_readability_text.csv ({len(final_df)} rows)"
-        f"\n   ({len(prev_result_dfs)} previously processed + {len(all_state_csvs)} new states merged)"
+        f"\n   ({len(prev_result_dfs)} previously processed files + {len(all_state_csvs)} new state results merged)"
     )
