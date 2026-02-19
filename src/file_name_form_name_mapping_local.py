@@ -1,41 +1,57 @@
+import argparse
 import pandas as pd
-import numpy as np
 import os
 import re
 import random
 import time
-from urllib.parse import unquote
-from multiprocessing import Pool, Manager, cpu_count, Value
+from multiprocessing import Pool, Manager, Value, Lock
 from tqdm import tqdm
 import threading
+from bs4 import BeautifulSoup
 
 from browser_utils import (
     create_browser,
     authenticate,
-    restart_browser,
     navigate_via_search,
-    is_session_expired,
     is_server_error,
-    wait_for_server_recovery,
-    BACKOFF_ON_500,
+    human_delay,
+    set_reauth_lock,
+    new_context_and_reauth,
+    create_http_session,
+    create_http_session_from_cookies,
+    refresh_http_cookies,
+    fetch_page,
+    keepalive_session,
+    pre_authenticate_all_states,
 )
 
-# Throttle settings — be gentle on the SERFF server
-MIN_DELAY_BETWEEN_ROWS = 2  # minimum seconds between requests
-MAX_DELAY_BETWEEN_ROWS = 5  # maximum seconds between requests
+# Throttle settings — longer delays to avoid IP blocks
+MIN_DELAY_BETWEEN_ROWS = 4  # minimum seconds between requests
+MAX_DELAY_BETWEEN_ROWS = 10  # maximum seconds between requests
+# Every N rows, take an extra long break to look less bot-like
+LONG_PAUSE_EVERY = 100
+LONG_PAUSE_MIN = 5
+LONG_PAUSE_MAX = 20
+# Keepalive ping every N rows to prevent session expiry
+KEEPALIVE_EVERY = 12
 
 # Shared counter for total-progress tracking across worker processes
 _shared_counter = None
 # Shared set of states whose authentication has permanently failed —
 # other workers skip chunks for these states immediately.
 _failed_states = None
+# Pre-authed cookies dict: {state_name: {cookie_name: cookie_value}}
+# Set by main process before pool creation; None means workers self-auth.
+_preauth_cookies = None
 
 
-def _init_worker(counter, failed_states):
+def _init_worker(counter, failed_states, reauth_lock, preauth_cookies=None):
     """Pool initializer: store shared objects in each worker."""
-    global _shared_counter, _failed_states
+    global _shared_counter, _failed_states, _preauth_cookies
     _shared_counter = counter
     _failed_states = failed_states
+    _preauth_cookies = preauth_cookies
+    set_reauth_lock(reauth_lock)
 
 
 def _monitor_progress(counter, total, stop_event):
@@ -71,97 +87,23 @@ def has_alpha_filing_id(url):
 def build_work_units(df):
     """
     Group rows by state — one work unit per state (no chunking).
+    Within each state, numeric filing IDs come first (HTTP-only, fast)
+    and alpha IDs last (need Playwright search, slower).
     Returns list of (work_label, state_name, df_for_state) tuples,
     sorted largest-first so big states start processing early.
     """
     units = []
     for state_name, state_df in df.groupby("state"):
-        state_df = state_df.reset_index(drop=True)
+        state_df = state_df.copy()
+        state_df["_is_alpha"] = state_df["page_url"].apply(has_alpha_filing_id)
+        state_df = (
+            state_df.sort_values("_is_alpha", kind="stable")
+            .drop(columns="_is_alpha")
+            .reset_index(drop=True)
+        )
         units.append((state_name, state_name, state_df))
-    # Largest states first for better load balancing
     units.sort(key=lambda x: len(x[2]), reverse=True)
     return units
-
-
-def _try_direct_nav(page, url, idx, state_name):
-    """
-    Attempt direct URL navigation. Returns True if we landed on the filing
-    summary page, False otherwise (session expired, redirected, 500, timeout).
-    Handles 500 errors with backoff retries.
-    """
-    page.goto(url, wait_until="domcontentloaded")
-
-    # Check for 500 server error first
-    if is_server_error(page):
-        print(
-            f"[500] PID {os.getpid()} row {idx}: Server error on direct nav for {url}"
-        )
-        for err_attempt in range(len(BACKOFF_ON_500)):
-            if wait_for_server_recovery(page, state_name, err_attempt):
-                page.goto(url, wait_until="domcontentloaded")
-                if not is_server_error(page) and "filingSummary" in page.url:
-                    return True
-        print(
-            f"[500] PID {os.getpid()} row {idx}: Server still returning 500 after retries, falling back to search..."
-        )
-        return False
-
-    if is_session_expired(page):
-        print(
-            f"[WARN] PID {os.getpid()} row {idx}: Session expired on direct nav for {url}, falling back to search..."
-        )
-        return False
-
-    try:
-        page.locator("div.row").first.wait_for(state="attached", timeout=15000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-        if "filingSummary" in page.url:
-            return True
-        else:
-            print(
-                f"[WARN] PID {os.getpid()} row {idx}: Redirected to {page.url}, falling back to search..."
-            )
-            return False
-    except Exception:
-        print(
-            f"[WARN] PID {os.getpid()} row {idx}: Direct nav failed for {url}, falling back to search..."
-        )
-        return False
-
-
-def _try_direct_nav_fallback(page, url):
-    """
-    After a browser restart + failed search nav, try loading the URL directly
-    and wait for page content. Returns True on success.
-    """
-    page.goto(url, wait_until="domcontentloaded")
-    try:
-        page.locator("div.row").first.wait_for(state="attached", timeout=15000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
-        return True
-    except Exception:
-        return False
-
-
-def _re_navigate(page, context, tracking_number, is_alpha, url, state_name):
-    """
-    Re-navigate after a browser restart: try search first, then direct URL.
-    Returns True if we successfully landed on the filing summary page.
-    """
-    if tracking_number and not (
-        isinstance(tracking_number, float) and pd.isna(tracking_number)
-    ):
-        if navigate_via_search(page, context, tracking_number, state_name):
-            return True
-    if not is_alpha:
-        return _try_direct_nav_fallback(page, url)
-    return False
 
 
 PANEL_IDS = {
@@ -180,33 +122,26 @@ _HEADER_ALIASES = {
 }
 
 
-def _parse_panel_rows(page, panel_id, section_name):
+def _parse_panel_rows_bs(soup, panel_id, section_name):
     """
-    Parse attachment rows from a single panel on the filing summary page.
-    Dynamically detects column layout from the header row.
-
-    Returns list of dicts:
-      [{"filename": "...", "form_name": "...", "form_number": "...", "section": "..."}]
+    Parse attachment rows from a panel using BeautifulSoup.
+    Works with HTML strings fetched via requests (no browser needed).
     """
     results = []
-    panel = page.locator(f"[id='{panel_id}']")
-
-    if panel.count() == 0:
+    panel = soup.find(id=panel_id)
+    if not panel:
         return results
 
-    content_text = panel.inner_text().strip()
-    if content_text == "None Available":
+    if panel.get_text(strip=True) == "None Available":
         return results
 
-    # Discover column layout from the header row
-    headers = panel.locator("div.summaryScheduleItemHeader")
-    header_count = headers.count()
-    if header_count == 0:
+    headers = panel.find_all("div", class_="summaryScheduleItemHeader")
+    if not headers:
         return results
 
     col_map = {}
-    for i in range(header_count):
-        raw = headers.nth(i).inner_text().strip().lower()
+    for i, h in enumerate(headers):
+        raw = h.get_text(strip=True).lower()
         canonical = _HEADER_ALIASES.get(raw)
         if canonical:
             col_map[i] = canonical
@@ -214,44 +149,40 @@ def _parse_panel_rows(page, panel_id, section_name):
     if "attachments" not in col_map.values():
         return results
 
-    # Get all top-level .row divs inside the panel's output-panel wrapper
-    output_panel = panel.locator("div.ui-outputpanel")
-    if output_panel.count() == 0:
+    output_panel = panel.find("div", class_="ui-outputpanel")
+    if not output_panel:
         output_panel = panel
 
-    all_rows = output_panel.locator(":scope > div.row")
-    row_count = all_rows.count()
+    all_rows = output_panel.find_all("div", class_="row", recursive=False)
 
-    for r in range(row_count):
-        row_el = all_rows.nth(r)
-        cells = row_el.locator(":scope > div.summaryScheduleItemData")
-        cell_count = cells.count()
-
-        if cell_count == 0:
+    for row_el in all_rows:
+        cells = row_el.find_all(
+            "div", class_="summaryScheduleItemData", recursive=False
+        )
+        if not cells:
             continue
 
         row_data = {}
         attachment_cell = None
-        for c in range(cell_count):
+        for c, cell in enumerate(cells):
             canonical = col_map.get(c)
             if canonical == "attachments":
-                attachment_cell = cells.nth(c)
+                attachment_cell = cell
             elif canonical:
-                row_data[canonical] = cells.nth(c).inner_text().strip()
+                row_data[canonical] = cell.get_text(strip=True)
 
         if attachment_cell is None:
             continue
 
-        links = attachment_cell.locator("a")
-        link_count = links.count()
-        if link_count == 0:
+        links = attachment_cell.find_all("a")
+        if not links:
             continue
 
         form_name = row_data.get("form_name", "")
         form_number = row_data.get("form_number")
 
-        for li in range(link_count):
-            filename = links.nth(li).inner_text().strip()
+        for link in links:
+            filename = link.get_text(strip=True)
             if filename:
                 results.append(
                     {
@@ -265,22 +196,23 @@ def _parse_panel_rows(page, panel_id, section_name):
     return results
 
 
-def scrape_attachment_mappings(page):
+def scrape_attachment_mappings_html(html):
     """
-    Scrape the filing summary page to build a mapping of
+    Parse a filing summary page's HTML to build a mapping of
     PDF filename → {form_name, form_number, section}.
 
+    Uses BeautifulSoup — works with HTML fetched via requests or Playwright.
     Returns dict keyed by filename, or empty dict on failure.
     """
-    try:
-        page.locator("#attachmentsContainer").wait_for(state="attached", timeout=15000)
-    except Exception:
+    soup = BeautifulSoup(html, "html.parser")
+
+    if not soup.find(id="attachmentsContainer"):
         return {}
 
     mapping = {}
     for section_name, panel_id in PANEL_IDS.items():
         try:
-            rows = _parse_panel_rows(page, panel_id, section_name)
+            rows = _parse_panel_rows_bs(soup, panel_id, section_name)
             for entry in rows:
                 fname = entry.pop("filename")
                 if fname not in mapping:
@@ -295,15 +227,62 @@ def scrape_attachment_mappings(page):
     return mapping
 
 
+def _ensure_browser(pw, browser, context, page, state_name):
+    """
+    Lazily launch a headless browser for alpha-ID search navigation.
+    If pre-authed cookies exist, loads them into the context (no re-auth).
+    Re-uses existing browser if already running.
+    Returns (pw, browser, context, page).
+    """
+    if browser is not None:
+        return pw, browser, context, page
+    from playwright.sync_api import sync_playwright
+    from browser_utils import _launch_browser, _new_stealth_context
+
+    print(
+        f"[BROWSER] PID {os.getpid()} launching headless Firefox for alpha-ID search ({state_name})..."
+    )
+    pw = sync_playwright().start()
+    browser = _launch_browser(pw)
+    context = _new_stealth_context(browser)
+    page = context.new_page()
+
+    if _preauth_cookies is not None and state_name in _preauth_cookies:
+        context.add_cookies(_preauth_cookies[state_name])
+        print(f"[BROWSER] PID {os.getpid()} loaded pre-authed cookies for {state_name}")
+    else:
+        authenticate(page, state_name)
+
+    return pw, browser, context, page
+
+
+def _reauth_and_refresh(browser, context, page, state_name, http_session):
+    """
+    Re-authenticate with a fresh context and update the HTTP session cookies.
+    Closes old context first so the server-side session slot is freed.
+    Returns (context, page, http_session, auth_ok).
+    """
+    context, page, auth_ok = new_context_and_reauth(
+        browser, state_name, old_context=context
+    )
+    if auth_ok and http_session is not None:
+        refresh_http_cookies(context, http_session)
+    return context, page, http_session, auth_ok
+
+
 def process_state(state_data):
     """
-    Process all rows for one state with a single browser.
-    state_data is a tuple: (work_label, state_name, df_for_state)
-    The worker owns this state end-to-end, checkpointing every 100 rows.
+    Process all rows for one state.
+
+    If pre-authed cookies are available (_preauth_cookies), the worker
+    skips Playwright auth entirely and uses requests.Session for 94% of
+    rows.  A headless browser is only launched on-demand when an alpha
+    filing ID requires search navigation (6% of rows).
+
+    Without pre-auth, falls back to the original browser-first flow.
     """
     work_label, state_name, df_state = state_data
 
-    # Fast-skip: another worker already proved this state is unreachable
     if _failed_states is not None and state_name in _failed_states:
         print(
             f"[SKIP] {work_label}: state {state_name} already marked as failed, skipping"
@@ -313,38 +292,36 @@ def process_state(state_data):
     df_state = df_state.copy()
     df_state["form_name_mapping"] = None
 
-    pw, browser, context, page = create_browser()
+    # Stagger worker startups
+    time.sleep(random.uniform(1, 6))
 
-    try:
-        # Authenticate with retries (3 attempts with backoff)
-        AUTH_RETRIES = 3
-        auth_ok = False
-        for attempt in range(1, AUTH_RETRIES + 1):
-            # Check again in case another worker marked it while we were retrying
-            if _failed_states is not None and state_name in _failed_states:
-                print(
-                    f"[SKIP] {work_label}: state {state_name} marked as failed by another worker"
-                )
-                return None
-            auth_ok = authenticate(page, state_name)
-            if auth_ok:
-                break
-            if attempt < AUTH_RETRIES:
-                wait = attempt * 5  # 5s, 10s backoff
-                print(
-                    f"[RETRY] {work_label}: auth attempt {attempt}/{AUTH_RETRIES} failed, retrying in {wait}s..."
-                )
-                time.sleep(wait)
+    # --- Bootstrap HTTP session -----------------------------------------------
+    pw = browser = context = page = None
+    http_session = None
 
+    has_preauth = _preauth_cookies is not None and state_name in _preauth_cookies
+
+    if has_preauth:
+        http_session = create_http_session_from_cookies(_preauth_cookies[state_name])
+        print(f"[WORKER] PID {os.getpid()} using pre-authed cookies for {state_name}")
+    else:
+        pw, browser, context, page = create_browser()
+        auth_ok = authenticate(page, state_name)
         if not auth_ok:
-            print(
-                f"[ERROR] All {AUTH_RETRIES} auth attempts failed for {work_label} — marking state {state_name} as failed"
+            context, page, auth_ok = new_context_and_reauth(
+                browser, state_name, old_context=context
             )
+        if not auth_ok:
+            print(f"[ERROR] Auth failed for {work_label} — marking state as failed")
             if _failed_states is not None:
                 _failed_states[state_name] = True
             return None
+        http_session = create_http_session(context)
 
-        # Process all URLs for this state
+    # --- Process rows ---------------------------------------------------------
+    rows_since_keepalive = 0
+
+    try:
         for row in tqdm(
             df_state.itertuples(),
             total=len(df_state),
@@ -354,116 +331,147 @@ def process_state(state_data):
             url = row.page_url
 
             try:
-                # --- Navigation ---
-                # "SERFF Tracking Number" column becomes _7 in itertuples (spaces in name)
-                tracking_number = getattr(row, "_7", None)
+                tracking_number = getattr(row, "_1", None)
                 is_alpha = has_alpha_filing_id(url)
-                nav_ok = False
+                html = None
 
-                # Step A: Try direct URL navigation first (skip for alpha IDs)
+                # ---- Path 1: Direct URL via requests (no browser) ----
                 if not is_alpha:
-                    nav_ok = _try_direct_nav(page, url, idx, state_name)
+                    page_html, expired, srv_err = fetch_page(http_session, url)
 
-                # Step B: If direct nav failed (or alpha ID), try search-based navigation
-                if not nav_ok:
+                    if srv_err:
+                        print(
+                            f"[500] PID {os.getpid()} row {idx}: Server error via HTTP for {url}"
+                        )
+                        time.sleep(random.uniform(15, 30))
+                        page_html, expired, srv_err = fetch_page(http_session, url)
+
+                    if expired and not srv_err:
+                        print(
+                            f"[HTTP] PID {os.getpid()} row {idx}: Session expired, re-authenticating..."
+                        )
+                        pw, browser, context, page = _ensure_browser(
+                            pw, browser, context, page, state_name
+                        )
+                        context, page, http_session, auth_ok = _reauth_and_refresh(
+                            browser, context, page, state_name, http_session
+                        )
+                        if auth_ok:
+                            page_html, expired, srv_err = fetch_page(http_session, url)
+                        else:
+                            print(
+                                f"[ERROR] PID {os.getpid()} row {idx}: Re-auth failed, skipping row"
+                            )
+                            continue
+
+                    if page_html and not expired and not srv_err:
+                        if (
+                            "filingSummary" in url
+                            or "attachmentsContainer" in page_html
+                        ):
+                            html = page_html
+
+                # ---- Path 2: Alpha IDs or failed direct fetch -> Playwright search ----
+                if html is None:
                     if not tracking_number or (
                         isinstance(tracking_number, float) and pd.isna(tracking_number)
                     ):
                         print(
-                            f"[SKIP] PID {os.getpid()} row {idx}: No SERFF Tracking Number, cannot search for {url}"
+                            f"[SKIP] PID {os.getpid()} row {idx}: No tracking number for {url}"
                         )
                         continue
 
-                    # Try search-based nav with fresh browser on failure (3 attempts)
+                    pw, browser, context, page = _ensure_browser(
+                        pw, browser, context, page, state_name
+                    )
+
                     for search_attempt in range(3):
-                        if search_attempt == 1:
-                            # Second attempt: restart browser first
+                        if search_attempt > 0:
+                            wait = 15 * search_attempt
                             print(
-                                f"[WARN] PID {os.getpid()} row {idx}: Search nav failed, restarting browser for retry..."
+                                f"[WARN] PID {os.getpid()} row {idx}: Search attempt {search_attempt+1}/3 for {tracking_number}, waiting {wait}s..."
                             )
-                            browser, context, page, _ = restart_browser(
-                                pw, browser, state_name
-                            )
-                        elif search_attempt == 2:
-                            # Third attempt: wait longer in case of server overload
-                            print(
-                                f"[WARN] PID {os.getpid()} row {idx}: Search nav failed again, waiting 30s then retrying..."
-                            )
-                            time.sleep(30)
-                            browser, context, page, _ = restart_browser(
-                                pw, browser, state_name
+                            time.sleep(wait)
+                            context, page, http_session, _ = _reauth_and_refresh(
+                                browser, context, page, state_name, http_session
                             )
 
                         if navigate_via_search(
                             page, context, tracking_number, state_name
                         ):
-                            # Check if search landed on a 500 page
-                            if is_server_error(page):
-                                print(
-                                    f"[500] PID {os.getpid()} row {idx}: Server error after search nav for {tracking_number}"
-                                )
-                                wait_for_server_recovery(
-                                    page, state_name, search_attempt
-                                )
-                                continue
-                            nav_ok = True
-                            break
-                        # Check if the failure was due to a 500 error
-                        if is_server_error(page):
+                            if not is_server_error(page):
+                                html = page.content()
+                                break
                             print(
-                                f"[500] PID {os.getpid()} row {idx}: Server error during search for {tracking_number}, waiting before retry..."
+                                f"[500] PID {os.getpid()} row {idx}: 500 after search for {tracking_number}"
                             )
-                            wait_for_server_recovery(page, state_name, search_attempt)
-                        else:
+                            time.sleep(random.uniform(15, 30))
+                        elif is_server_error(page):
                             print(
-                                f"[WARN] PID {os.getpid()} row {idx}: Search nav attempt {search_attempt + 1}/3 failed for {tracking_number}"
+                                f"[500] PID {os.getpid()} row {idx}: 500 during search for {tracking_number}"
                             )
+                            time.sleep(random.uniform(15, 30))
 
-                    if not nav_ok:
+                    if html is None:
                         print(
-                            f"[SKIP] PID {os.getpid()} row {idx}: All nav methods failed for {url} ({tracking_number}), restarting browser..."
-                        )
-                        browser, context, page, _ = restart_browser(
-                            pw, browser, state_name
+                            f"[SKIP] PID {os.getpid()} row {idx}: All nav failed for {tracking_number}"
                         )
                         continue
 
-                mapping = scrape_attachment_mappings(page)
+                # ---- Parse with BeautifulSoup ----
+                mapping = scrape_attachment_mappings_html(html)
                 if mapping:
                     df_state.at[idx, "form_name_mapping"] = str(mapping)
 
             except Exception as e:
                 serf = getattr(row, "serf_num", "unknown")
                 print(
-                    f"[ERROR] PID {os.getpid()} row {idx} (serf_num={serf}): Unexpected error for {url}: {str(e).splitlines()[0]}, restarting browser..."
+                    f"[ERROR] PID {os.getpid()} row {idx} (serf_num={serf}): {str(e).splitlines()[0]}"
                 )
-                browser, context, page, _ = restart_browser(pw, browser, state_name)
-                # Continue to next row — don't let one bad row crash the chunk
+                if browser is not None:
+                    try:
+                        context, page, http_session, _ = _reauth_and_refresh(
+                            browser, context, page, state_name, http_session
+                        )
+                    except Exception:
+                        pass
                 continue
             finally:
-                # Increment the total-progress counter (runs on success, skip, or error)
                 if _shared_counter is not None:
                     with _shared_counter.get_lock():
                         _shared_counter.value += 1
-                # Throttle: random delay between rows to avoid hammering the server
+
+                rows_since_keepalive += 1
+
+                if rows_since_keepalive >= KEEPALIVE_EVERY:
+                    keepalive_session(http_session)
+                    rows_since_keepalive = 0
+
                 delay = random.uniform(MIN_DELAY_BETWEEN_ROWS, MAX_DELAY_BETWEEN_ROWS)
                 time.sleep(delay)
 
-            # Checkpoint save every 100 rows
+                if idx > 0 and idx % LONG_PAUSE_EVERY == 0:
+                    pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
+                    print(
+                        f"[THROTTLE] PID {os.getpid()} taking {pause:.0f}s breather after {idx} rows..."
+                    )
+                    time.sleep(pause)
+
             if idx % 100 == 0 and idx > 0:
                 checkpoint_file = f"outputs/temp_results_{work_label}_{os.getpid()}.csv"
                 df_state.to_csv(checkpoint_file, index=False)
     finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass
 
-    # Save final results for this work unit
     safe_label = "".join(
         c if c.isalnum() or c in (" ", "-", "_") else "_" for c in work_label
     )
@@ -526,8 +534,28 @@ def load_already_processed(output_dir="outputs"):
     return processed_serf_nums, processed_dfs
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="SERFF filing attachment mapper")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run pre-auth without a visible browser (fully unattended, uses backoff only)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel worker processes (default: 10)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    form_df = pd.read_csv("data/batch_1.csv")
+    args = parse_args()
+    n_proc = args.workers
+    headed = not args.headless
+
+    form_df = pd.read_csv("data/old_data_from_name_fetch_3.csv")
     df = form_df.copy()
 
     # ------------------------------------------------------------------
@@ -539,29 +567,22 @@ if __name__ == "__main__":
     if already_done_serf_nums:
         df = df[~df["serf_num"].isin(already_done_serf_nums)].reset_index(drop=True)
         print(
-            f"[RESUME] Filtered: {original_len} → {len(df)} rows remaining to process"
+            f"[RESUME] Filtered: {original_len} -> {len(df)} rows remaining to process"
         )
+
+    df = df.iloc[::-1].reset_index(drop=True)
 
     if len(df) == 0:
         print("[RESUME] All rows already processed! Combining previous results...")
         final_df = pd.concat(prev_result_dfs, ignore_index=True)
-        final_df.to_csv("form_names_readability_text.csv", index=False)
-        print(
-            f"\n✅ Results saved to form_names_readability_text.csv ({len(final_df)} rows)"
-        )
+        final_df.to_csv("form_names_mapping.csv", index=False)
+        print(f"\nResults saved to form_names_mapping.csv ({len(final_df)} rows)")
         exit(0)
 
-    n_proc = 6  # Single process — Playwright + multiprocessing causes EPIPE on macOS
-
-    # Group data by state — one work unit per state, largest first
     work_units = build_work_units(df)
+    total_batches = (len(work_units) + n_proc - 1) // n_proc
 
-    # ------------------------------------------------------------------
-    # Each core gets one state at a time. Largest states start first.
-    # When a core finishes a state, it picks up the next unassigned
-    # state automatically (via imap_unordered).
-    # ------------------------------------------------------------------
-    print(f"Processing {len(work_units)} states with {n_proc} processes")
+    print(f"\n{len(work_units)} states, {n_proc} workers, {total_batches} batches")
     print(
         f"Total URLs to process: {len(df)} (skipped {original_len - len(df)} already done)"
     )
@@ -569,11 +590,9 @@ if __name__ == "__main__":
         print(f"  {rank}. {w_label}: {len(w_df)} URLs")
     print("=" * 70)
 
-    actual_procs = min(n_proc, len(work_units))
-
-    # Shared counter for total progress across all workers
+    # Shared objects that persist across all batches
     total_counter = Value("i", 0)
-    # Shared dict to track states whose auth permanently failed
+    reauth_lock = Lock()
     manager = Manager()
     failed_states = manager.dict()
 
@@ -585,12 +604,37 @@ if __name__ == "__main__":
     )
     monitor.start()
 
-    with Pool(
-        actual_procs, initializer=_init_worker, initargs=(total_counter, failed_states)
-    ) as pool:
-        # imap_unordered feeds states (largest first); each worker picks
-        # the next state as soon as it finishes one
-        state_result_files = list(pool.imap_unordered(process_state, work_units))
+    all_result_files = []
+
+    # ------------------------------------------------------------------
+    # Process states in batches — auth only the batch about to run
+    # so cookies stay fresh.
+    # ------------------------------------------------------------------
+    for batch_start in range(0, len(work_units), n_proc):
+        batch = work_units[batch_start : batch_start + n_proc]
+        batch_num = batch_start // n_proc + 1
+        batch_states = [s for s, _, _ in batch]
+
+        print(f"\n{'='*70}")
+        print(f"Batch {batch_num}/{total_batches}: {', '.join(batch_states)}")
+        print(f"{'='*70}")
+
+        preauth_cookies = pre_authenticate_all_states(batch_states, headed=headed)
+
+        for s in batch_states:
+            if s not in preauth_cookies:
+                failed_states[s] = True
+
+        actual_procs = min(n_proc, len(batch))
+
+        with Pool(
+            actual_procs,
+            initializer=_init_worker,
+            initargs=(total_counter, failed_states, reauth_lock, dict(preauth_cookies)),
+        ) as pool:
+            results = list(pool.imap_unordered(process_state, batch))
+
+        all_result_files.extend(results)
 
     stop_event.set()
     monitor.join()
@@ -598,10 +642,10 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Combine ALL state results with PREVIOUSLY processed results
     # ------------------------------------------------------------------
-    all_dfs = list(prev_result_dfs)  # copy the list
+    all_dfs = list(prev_result_dfs)
     all_state_csvs = []
 
-    for f in state_result_files:
+    for f in all_result_files:
         if f is not None and os.path.exists(f):
             all_dfs.append(pd.read_csv(f))
             all_state_csvs.append(f)
@@ -611,13 +655,10 @@ if __name__ == "__main__":
         exit(1)
 
     final_df = pd.concat(all_dfs, ignore_index=True)
-
-    # Deduplicate by serf_num — keep the last (most recent) entry
     final_df = final_df.drop_duplicates(subset="serf_num", keep="last")
-
     final_df.to_csv("form_names_mapping.csv", index=False)
 
     print(
-        f"\n✅ All done. Results saved to form_names_readability_text.csv ({len(final_df)} rows)"
-        f"\n   ({len(prev_result_dfs)} previously processed files + {len(all_state_csvs)} new state results merged)"
+        f"\nAll done. Results saved to form_names_mapping.csv ({len(final_df)} rows)"
+        f"\n  ({len(prev_result_dfs)} previously processed files + {len(all_state_csvs)} new state results merged)"
     )

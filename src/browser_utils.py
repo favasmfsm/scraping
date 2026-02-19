@@ -9,12 +9,18 @@ Usage (sync API, compatible with multiprocessing):
         create_browser, authenticate, navigate_via_search,
         navigate_with_session_check, click_select_buttons,
         wait_for_ajax, download_zip, restart_browser,
-        ensure_single_tab, is_session_expired,
+        ensure_single_tab, is_session_expired, human_delay,
+        set_reauth_lock, new_context_and_reauth,
+        create_http_session, create_http_session_from_cookies,
+        refresh_http_cookies, fetch_page, keepalive_session,
+        pre_authenticate_all_states,
     )
 """
 
 import os
 import time
+import random
+import requests as _requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -24,19 +30,115 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 BACKOFF_ON_500 = [15, 30, 60]  # seconds to wait on successive 500 errors
 
-# Realistic user-agent (Chrome 131 on macOS)
-_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+# Firefox user-agent strings — must match the actual browser engine to avoid
+# TLS/UA mismatch detection (Firefox TLS fingerprint != Chrome TLS fingerprint)
+_USER_AGENTS = [
+    # Firefox 133 – macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:133.0) Gecko/20100101 Firefox/133.0",
+    # Firefox 132 – macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:132.0) Gecko/20100101 Firefox/132.0",
+    # Firefox 131 – macOS Ventura
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.6; rv:131.0) Gecko/20100101 Firefox/131.0",
+    # Firefox 133 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    # Firefox 132 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    # Firefox 131 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    # Firefox 133 – Windows 11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    # Firefox 130 – macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:130.0) Gecko/20100101 Firefox/130.0",
+    # Firefox 129 – macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:129.0) Gecko/20100101 Firefox/129.0",
+    # Firefox 128 ESR – Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+]
 
-# JS to inject on every new page to hide automation fingerprints (Dynatrace)
+# Viewport sizes that look like real monitors
+_VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1280, "height": 720},
+    {"width": 1600, "height": 900},
+    {"width": 2560, "height": 1440},
+]
+
+# Stealth JS tailored for Firefox — no Chrome-specific objects
 _STEALTH_SCRIPT = """
+    // Hide webdriver flag (primary automation indicator)
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+    try { delete navigator.__proto__.webdriver; } catch(e) {}
+
+    // Firefox-realistic plugin list (PDF viewer only)
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const plugins = [
+                {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+                {name: 'Firefox PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            ];
+            plugins.length = 2;
+            return plugins;
+        }
+    });
+
+    // Languages
     Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-    window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'language', {get: () => 'en-US'});
+
+    // Platform
+    Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
+
+    // Firefox does NOT have window.chrome — don't add it (that would be a red flag)
+
+    Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+
+    // Fake permissions API
+    if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (params) => (
+            params.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : origQuery(params)
+        );
+    }
+
+    // Override hardwareConcurrency
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+
+    // Canvas fingerprint noise
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+        if (type === 'image/png' || type === undefined) {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                const imageData = ctx.getImageData(0, 0, this.width, this.height);
+                for (let i = 0; i < imageData.data.length; i += 100) {
+                    imageData.data[i] = imageData.data[i] ^ 1;
+                }
+                ctx.putImageData(imageData, 0, 0);
+            }
+        }
+        return origToDataURL.apply(this, arguments);
+    };
 """
+
+# Optional proxy — set env var SCRAPER_PROXY to use (e.g. "http://user:pass@host:port")
+PROXY_URL = os.environ.get("SCRAPER_PROXY", "")
+
+# Jittered exponential backoff for auth retries (min_seconds, max_seconds)
+_AUTH_BACKOFF = [(15, 45), (30, 90), (60, 180), (120, 300)]
+
+# Global re-auth lock — set by worker initializer via set_reauth_lock()
+_reauth_lock = None
+
+
+def set_reauth_lock(lock):
+    """Set the global re-auth lock (called from worker initializer)."""
+    global _reauth_lock
+    _reauth_lock = lock
 
 
 # ---------------------------------------------------------------------------
@@ -44,35 +146,63 @@ _STEALTH_SCRIPT = """
 # ---------------------------------------------------------------------------
 
 
+def _pick_identity():
+    """Pick a random user-agent + viewport combo for a new context."""
+    return random.choice(_USER_AGENTS), random.choice(_VIEWPORTS)
+
+
+_FIREFOX_PREFS = {
+    "dom.webdriver.enabled": False,
+    "useAutomationExtension": False,
+    "privacy.trackingprotection.enabled": False,
+    "network.http.connection-timeout": 90,
+}
+
+
+def _launch_browser(pw, headed=False):
+    """Launch Firefox with optional proxy and anti-detection prefs."""
+    kwargs = dict(
+        headless=not headed,
+        firefox_user_prefs=_FIREFOX_PREFS,
+    )
+    if PROXY_URL:
+        kwargs["proxy"] = {"server": PROXY_URL}
+    return pw.firefox.launch(**kwargs)
+
+
 def _new_stealth_context(browser):
-    """Create a new browser context with anti-detection settings."""
+    """Create a new browser context with randomized anti-detection settings."""
+    ua, vp = _pick_identity()
     context = browser.new_context(
         accept_downloads=True,
-        user_agent=_USER_AGENT,
-        viewport={"width": 1920, "height": 1080},
+        user_agent=ua,
+        viewport=vp,
         locale="en-US",
+        timezone_id="America/New_York",
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
-    # Inject stealth JS before every page navigation (bypasses Dynatrace RUM)
     context.add_init_script(_STEALTH_SCRIPT)
     return context
 
 
+def human_delay(low=0.5, high=2.0):
+    """Small random delay to mimic human interaction timing."""
+    time.sleep(random.uniform(low, high))
+
+
 def create_browser():
     """
-    Launch a headless Chromium instance with an isolated context.
+    Launch a headless Firefox instance with an isolated context.
     Returns (pw, browser, context, page).
 
-    Includes anti-detection measures to bypass Dynatrace RUM bot fingerprinting.
+    Firefox has a distinct TLS fingerprint from Chromium, making it
+    much harder for WAFs to flag. Each call gets a random user-agent
+    and viewport to reduce fingerprint correlation across workers.
     """
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
+    browser = _launch_browser(pw)
     context = _new_stealth_context(browser)
     page = context.new_page()
     return pw, browser, context, page
@@ -80,8 +210,8 @@ def create_browser():
 
 def restart_browser(pw, browser, state_name):
     """
-    Kill the current browser and start a fresh one. Re-authenticates.
-    Returns (browser, context, page, auth_ok).
+    Kill the current browser and start a fresh one with a new identity.
+    Re-authenticates. Returns (browser, context, page, auth_ok).
     """
     print(f"[RESTART] Killing browser and starting fresh for {state_name}...")
     try:
@@ -89,14 +219,10 @@ def restart_browser(pw, browser, state_name):
     except Exception:
         pass
 
-    browser = pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
+    # Pause before restart to avoid rapid reconnect pattern
+    time.sleep(random.uniform(3, 8))
+
+    browser = _launch_browser(pw)
     context = _new_stealth_context(browser)
     page = context.new_page()
     auth_ok = authenticate(page, state_name)
@@ -136,49 +262,91 @@ def wait_for_server_recovery(page, state_name, attempt=0):
     Re-authenticates after waiting. Returns True if re-auth succeeded.
     """
     delay = BACKOFF_ON_500[min(attempt, len(BACKOFF_ON_500) - 1)]
-    print(f"[500] Server error detected (attempt {attempt + 1}). Waiting {delay}s before retry...")
+    print(
+        f"[500] Server error detected (attempt {attempt + 1}). Waiting {delay}s before retry..."
+    )
     time.sleep(delay)
     return authenticate(page, state_name)
 
 
-def authenticate(page, state_name, max_500_retries=3):
+def authenticate(page, state_name, max_retries=5):
     """
     Authenticate for a specific state on SERFF.
+
+    Uses a global lock so only one worker re-authenticates at a time,
+    preventing the thundering-herd problem.  Retries use jittered
+    exponential backoff (_AUTH_BACKOFF).
+
     Returns True if successful, False otherwise.
-    Handles 500 errors by waiting and retrying.
     """
     auth_url = f"https://filingaccess.serff.com/sfa/home/{state_name}"
 
-    for attempt in range(max_500_retries):
-        try:
-            page.goto(auth_url, wait_until="domcontentloaded")
-            time.sleep(2)
+    lock = _reauth_lock
+    if lock:
+        lock.acquire()
+        print(f"[LOCK] PID {os.getpid()} acquired re-auth lock for {state_name}")
 
-            # Check for 500 error on auth page
-            if is_server_error(page):
-                delay = BACKOFF_ON_500[min(attempt, len(BACKOFF_ON_500) - 1)]
-                print(f"[500] Auth page returned 500 for {state_name} (attempt {attempt+1}/{max_500_retries}), waiting {delay}s...")
-                time.sleep(delay)
-                continue
-
-            page.locator("a[href*='userAgreement.xhtml']:has-text('Begin Search')").click(
-                timeout=10000
-            )
-            page.locator("span:has-text('Accept')").click(timeout=10000)
+    try:
+        for attempt in range(max_retries):
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            print(
-                f"[ERROR] Authentication failed for {state_name} (attempt {attempt+1}): {str(e).splitlines()[0]}"
-            )
-            if attempt < max_500_retries - 1:
-                time.sleep(5)
+                page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                human_delay(2.0, 4.0)
 
-    print(f"[ERROR] Authentication failed for {state_name} after {max_500_retries} attempts")
-    return False
+                if is_server_error(page):
+                    delay = BACKOFF_ON_500[min(attempt, len(BACKOFF_ON_500) - 1)]
+                    print(
+                        f"[500] Auth page returned 500 for {state_name} (attempt {attempt+1}/{max_retries}), waiting {delay}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                # Wait for "Begin Search" to appear in the DOM before clicking
+                begin_btn = page.locator(
+                    "a[href*='userAgreement.xhtml']:has-text('Begin Search')"
+                )
+                begin_btn.wait_for(state="visible", timeout=20000)
+                human_delay(0.5, 1.5)
+                begin_btn.click(timeout=10000)
+                human_delay(1.0, 2.5)
+
+                accept_btn = page.locator("span:has-text('Accept')")
+                accept_btn.wait_for(state="visible", timeout=20000)
+                human_delay(0.3, 1.0)
+                accept_btn.click(timeout=10000)
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                human_delay(1.0, 2.5)
+                print(f"[AUTH] PID {os.getpid()} authenticated for {state_name}")
+                return True
+
+            except Exception as e:
+                print(
+                    f"[ERROR] Auth failed for {state_name} (attempt {attempt+1}/{max_retries}): {str(e).splitlines()[0]}"
+                )
+                try:
+                    print(f"[DEBUG] URL: {page.url}")
+                    body = page.inner_text("body")
+                    print(f"[DEBUG] Body (first 300 chars): {body[:300]}")
+                except Exception:
+                    print(f"[DEBUG] Could not read page content")
+
+                if attempt < max_retries - 1:
+                    lo, hi = _AUTH_BACKOFF[min(attempt, len(_AUTH_BACKOFF) - 1)]
+                    wait = random.uniform(lo, hi)
+                    print(f"[BACKOFF] Waiting {wait:.0f}s before retry...")
+                    time.sleep(wait)
+
+        print(
+            f"[ERROR] Authentication failed for {state_name} after {max_retries} attempts"
+        )
+        return False
+    finally:
+        if lock:
+            lock.release()
+            print(f"[LOCK] PID {os.getpid()} released re-auth lock for {state_name}")
 
 
 def is_session_expired(page):
@@ -195,6 +363,246 @@ def is_session_expired(page):
         )
     except Exception:
         return True  # If we can't read the page, treat as expired
+
+
+def new_context_and_reauth(browser, state_name, old_context=None):
+    """
+    Create a fresh browser context (new identity) and authenticate.
+    Closes the old context first to release the server-side session.
+    Returns (context, page, auth_ok).
+    """
+    if old_context:
+        try:
+            old_context.close()
+        except Exception:
+            pass
+    # Brief pause so the server registers the old session as gone
+    time.sleep(random.uniform(2, 5))
+    context = _new_stealth_context(browser)
+    page = context.new_page()
+    auth_ok = authenticate(page, state_name)
+    return context, page, auth_ok
+
+
+# ---------------------------------------------------------------------------
+# HTTP session helpers (requests-based, no browser needed)
+# ---------------------------------------------------------------------------
+
+
+def extract_cookies(context):
+    """Extract cookies from a Playwright context as a dict for requests."""
+    return {c["name"]: c["value"] for c in context.cookies()}
+
+
+def create_http_session(context):
+    """
+    Create a requests.Session seeded with cookies from a Playwright context.
+    The session uses a matching Firefox user-agent.
+    """
+    session = _requests.Session()
+    session.cookies.update(extract_cookies(context))
+    session.headers.update(
+        {
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+        }
+    )
+    return session
+
+
+def refresh_http_cookies(context, session):
+    """Update an existing requests session with fresh cookies from Playwright."""
+    session.cookies.update(extract_cookies(context))
+
+
+def fetch_page(http_session, url, timeout=30):
+    """
+    Fetch a page via requests.  Much lighter than a full browser navigation.
+    Returns (html, is_expired, is_server_error) or (None, True, False) on failure.
+    """
+    try:
+        resp = http_session.get(url, timeout=timeout, allow_redirects=True)
+        html = resp.text
+        expired = (
+            "Begin Search" in html
+            or "userAgreement" in html
+            or "Session Expired" in html
+        )
+        srv_err = resp.status_code >= 500 or "500.xhtml" in resp.url
+        return html, expired, srv_err
+    except _requests.RequestException as e:
+        print(f"[HTTP] Request failed for {url}: {e}")
+        return None, True, False
+
+
+def create_http_session_from_cookies(cookies):
+    """
+    Create a requests.Session from pre-authed cookies.
+    Accepts either a Playwright cookie list ([{name, value, domain, ...}])
+    or a plain {name: value} dict.
+    """
+    session = _requests.Session()
+    if isinstance(cookies, list):
+        for c in cookies:
+            session.cookies.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain", ""),
+                path=c.get("path", "/"),
+            )
+    else:
+        session.cookies.update(cookies)
+    session.headers.update(
+        {
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+        }
+    )
+    return session
+
+
+def keepalive_session(http_session):
+    """
+    Send a lightweight HEAD request to the SERFF search page to keep the
+    server-side session alive.  Call this periodically between rows.
+    """
+    try:
+        http_session.head(
+            "https://filingaccess.serff.com/sfa/search/filingSearch.xhtml",
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
+_CAPTCHA_WAIT = 60  # seconds to wait for user to solve CAPTCHA
+
+
+def _poll_for_search_page(page, context, state, deadline):
+    """
+    Poll the headed browser waiting for the user to complete auth.
+    Auto-clicks "Begin Search" / "Accept" if they appear (CAPTCHA solved).
+    Returns cookies on success, None on timeout.
+    """
+    while time.time() < deadline:
+        try:
+            url = page.url
+            if "filingSearch" in url:
+                return context.cookies()
+
+            # CAPTCHA solved → "Begin Search" may have appeared, auto-click
+            begin = page.locator(
+                "a[href*='userAgreement.xhtml']:has-text('Begin Search')"
+            )
+            if begin.is_visible():
+                begin.click(timeout=5000)
+                human_delay(0.5, 1.0)
+                accept = page.locator("span:has-text('Accept')")
+                try:
+                    accept.wait_for(state="visible", timeout=10000)
+                    accept.click(timeout=5000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                if "filingSearch" in page.url:
+                    return context.cookies()
+        except Exception:
+            pass
+        time.sleep(3)
+    return None
+
+
+def pre_authenticate_all_states(states, headed=True):
+    """
+    Authenticate a list of states sequentially using a single browser.
+
+    Default mode (headed=True):
+      1. Open a visible browser, try auto-clicking through auth
+      2. If CAPTCHA blocks, user can solve it in the visible window
+      3. If user doesn't respond within 90s, fall back to backoff retries
+
+    Headless mode (headed=False):
+      Auto-click with jittered backoff retries only.
+
+    Returns {state_name: [full_cookie_dicts]}.
+    """
+    mode = "headed" if headed else "headless"
+    print(f"[PRE-AUTH] Authenticating {len(states)} states ({mode})...")
+    pw = sync_playwright().start()
+    browser = _launch_browser(pw, headed=headed)
+    all_cookies = {}
+
+    try:
+        for i, state in enumerate(states, 1):
+            print(f"[PRE-AUTH] ({i}/{len(states)}) {state}...", end=" ", flush=True)
+            context = _new_stealth_context(browser)
+            page = context.new_page()
+            try:
+                # Quick auto-click attempt (2 retries — fast if no CAPTCHA)
+                ok = authenticate(page, state, max_retries=2)
+                if ok:
+                    all_cookies[state] = context.cookies()
+                    print(f"OK ({len(all_cookies[state])} cookies)")
+                    continue
+
+                if headed:
+                    # Browser is visible — navigate fresh and let user solve CAPTCHA
+                    auth_url = f"https://filingaccess.serff.com/sfa/home/{state}"
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                    print(
+                        f"\n[CAPTCHA] Solve verification in the browser for {state} (waiting up to {_CAPTCHA_WAIT}s)..."
+                    )
+                    deadline = time.time() + _CAPTCHA_WAIT
+                    cookies = _poll_for_search_page(page, context, state, deadline)
+                    if cookies:
+                        all_cookies[state] = cookies
+                        print(f"[CAPTCHA] {state} authenticated!")
+                        continue
+                    print(
+                        f"[CAPTCHA] No response, falling back to backoff for {state}..."
+                    )
+
+                # Backoff fallback — fresh context, more retries
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                context = _new_stealth_context(browser)
+                page = context.new_page()
+                ok = authenticate(page, state, max_retries=5)
+                if ok:
+                    all_cookies[state] = context.cookies()
+                    print(f"OK ({len(all_cookies[state])} cookies) [backoff]")
+                else:
+                    print("FAILED")
+            except Exception as e:
+                print(f"ERROR: {str(e).splitlines()[0]}")
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            human_delay(1.0, 3.0)
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+    ok_count = len(all_cookies)
+    fail_count = len(states) - ok_count
+    print(f"[PRE-AUTH] Done: {ok_count} succeeded, {fail_count} failed")
+    return all_cookies
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +677,14 @@ def navigate_via_search(page, context, tracking_number, state_name):
     except PlaywrightTimeout:
         # Search page didn't load — likely session expired or 500
         if is_server_error(page):
-            print(f"[500] Search page 500 error, waiting before re-auth for {state_name}...")
+            print(
+                f"[500] Search page 500 error, waiting before re-auth for {state_name}..."
+            )
             wait_for_server_recovery(page, state_name, 0)
         else:
-            print(f"[INFO] Search page not loaded, re-authenticating for {state_name}...")
+            print(
+                f"[INFO] Search page not loaded, re-authenticating for {state_name}..."
+            )
         authenticate(page, state_name)
         page.goto(search_url, wait_until="domcontentloaded")
         try:
@@ -282,6 +694,7 @@ def navigate_via_search(page, context, tracking_number, state_name):
             return False
 
     input_locator.fill(str(tracking_number))
+    human_delay(0.5, 1.5)
 
     # Click search button
     try:
@@ -289,6 +702,8 @@ def navigate_via_search(page, context, tracking_number, state_name):
     except Exception:
         print(f"[ERROR] Could not click search button for {tracking_number}")
         return False
+
+    human_delay(1.0, 2.5)
 
     # Wait for results table and click the first row
     try:
