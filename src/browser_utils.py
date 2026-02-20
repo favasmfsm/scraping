@@ -129,16 +129,26 @@ _STEALTH_SCRIPT = """
 PROXY_URL = os.environ.get("SCRAPER_PROXY", "")
 
 # Jittered exponential backoff for auth retries (min_seconds, max_seconds)
-_AUTH_BACKOFF = [(15, 45), (30, 90), (60, 180), (120, 300)]
+_AUTH_BACKOFF = [(10, 20), (30, 90), (60, 180), (120, 300)]
 
 # Global re-auth lock — set by worker initializer via set_reauth_lock()
 _reauth_lock = None
+
+# When True, all browser launches are headed (visible) so the user can
+# solve CAPTCHAs.  Set via set_headed_mode() in worker initializer.
+_headed_mode = False
 
 
 def set_reauth_lock(lock):
     """Set the global re-auth lock (called from worker initializer)."""
     global _reauth_lock
     _reauth_lock = lock
+
+
+def set_headed_mode(headed):
+    """Set global headed mode (called from worker initializer)."""
+    global _headed_mode
+    _headed_mode = headed
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +169,11 @@ _FIREFOX_PREFS = {
 }
 
 
-def _launch_browser(pw, headed=False):
-    """Launch Firefox with optional proxy and anti-detection prefs."""
+def _launch_browser(pw, headed=None):
+    """Launch Firefox with optional proxy and anti-detection prefs.
+    If headed is None, uses the global _headed_mode setting."""
+    if headed is None:
+        headed = _headed_mode
     kwargs = dict(
         headless=not headed,
         firefox_user_prefs=_FIREFOX_PREFS,
@@ -194,15 +207,12 @@ def human_delay(low=0.5, high=2.0):
 
 def create_browser():
     """
-    Launch a headless Firefox instance with an isolated context.
+    Launch a **headless** Firefox instance with an isolated context.
     Returns (pw, browser, context, page).
-
-    Firefox has a distinct TLS fingerprint from Chromium, making it
-    much harder for WAFs to flag. Each call gets a random user-agent
-    and viewport to reduce fingerprint correlation across workers.
+    Always headless — headed mode is only used for auth steps.
     """
     pw = sync_playwright().start()
-    browser = _launch_browser(pw)
+    browser = _launch_browser(pw, headed=False)
     context = _new_stealth_context(browser)
     page = context.new_page()
     return pw, browser, context, page
@@ -269,13 +279,100 @@ def wait_for_server_recovery(page, state_name, attempt=0):
     return authenticate(page, state_name)
 
 
+_CAPTCHA_REAUTH_WAIT = 90  # seconds to wait for user in headed re-auth
+
+
+def _headed_reauth(state_name):
+    """
+    Open a temporary headed browser for the user to solve a CAPTCHA.
+    Returns cookie list on success, None on timeout.
+    Called while the re-auth lock is held.
+    """
+    print(f"\n[HEADED] Opening visible browser for {state_name} — solve CAPTCHA...")
+    pw = sync_playwright().start()
+    browser = _launch_browser(pw, headed=True)
+    cookies = None
+    try:
+        context = _new_stealth_context(browser)
+        page = context.new_page()
+        auth_url = f"https://filingaccess.serff.com/sfa/home/{state_name}"
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+
+        # Try auto-clicking in case no CAPTCHA this time
+        try:
+            begin = page.locator(
+                "a[href*='userAgreement.xhtml']:has-text('Begin Search')"
+            )
+            begin.wait_for(state="visible", timeout=8000)
+            begin.click(timeout=5000)
+            human_delay(0.5, 1.0)
+            accept = page.locator("span:has-text('Accept')")
+            accept.wait_for(state="visible", timeout=8000)
+            accept.click(timeout=5000)
+            page.wait_for_load_state("networkidle", timeout=10000)
+            if "filingSearch" in page.url:
+                cookies = context.cookies()
+                print(f"[HEADED] {state_name} authenticated (no CAPTCHA)")
+                return cookies
+        except Exception:
+            pass
+
+        # CAPTCHA likely present — poll for user to complete the flow
+        deadline = time.time() + _CAPTCHA_REAUTH_WAIT
+        print(
+            f"[HEADED] Waiting up to {_CAPTCHA_REAUTH_WAIT}s for you to solve CAPTCHA for {state_name}..."
+        )
+        while time.time() < deadline:
+            try:
+                if "filingSearch" in page.url:
+                    cookies = context.cookies()
+                    print(f"[HEADED] {state_name} authenticated!")
+                    return cookies
+
+                begin = page.locator(
+                    "a[href*='userAgreement.xhtml']:has-text('Begin Search')"
+                )
+                if begin.is_visible():
+                    begin.click(timeout=5000)
+                    human_delay(0.5, 1.0)
+                    accept = page.locator("span:has-text('Accept')")
+                    try:
+                        accept.wait_for(state="visible", timeout=10000)
+                        accept.click(timeout=5000)
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    if "filingSearch" in page.url:
+                        cookies = context.cookies()
+                        print(f"[HEADED] {state_name} authenticated!")
+                        return cookies
+            except Exception:
+                pass
+            time.sleep(3)
+
+        print(f"[HEADED] Timed out for {state_name}")
+        return None
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
 def authenticate(page, state_name, max_retries=5):
     """
     Authenticate for a specific state on SERFF.
 
-    Uses a global lock so only one worker re-authenticates at a time,
-    preventing the thundering-herd problem.  Retries use jittered
-    exponential backoff (_AUTH_BACKOFF).
+    Uses a global lock so only one worker re-authenticates at a time.
+    Retries use jittered exponential backoff.
+
+    If all headless retries fail and _headed_mode is True, opens a
+    visible browser for the user to solve the CAPTCHA, then applies
+    cookies back to the caller's context.
 
     Returns True if successful, False otherwise.
     """
@@ -300,7 +397,6 @@ def authenticate(page, state_name, max_retries=5):
                     time.sleep(delay)
                     continue
 
-                # Wait for "Begin Search" to appear in the DOM before clicking
                 begin_btn = page.locator(
                     "a[href*='userAgreement.xhtml']:has-text('Begin Search')"
                 )
@@ -338,6 +434,19 @@ def authenticate(page, state_name, max_retries=5):
                     wait = random.uniform(lo, hi)
                     print(f"[BACKOFF] Waiting {wait:.0f}s before retry...")
                     time.sleep(wait)
+
+        # All headless retries exhausted — try headed if enabled
+        if _headed_mode:
+            cookies = _headed_reauth(state_name)
+            if cookies:
+                page.context.add_cookies(cookies)
+                # Navigate to search page to confirm auth
+                page.goto(
+                    "https://filingaccess.serff.com/sfa/search/filingSearch.xhtml",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                return True
 
         print(
             f"[ERROR] Authentication failed for {state_name} after {max_retries} attempts"

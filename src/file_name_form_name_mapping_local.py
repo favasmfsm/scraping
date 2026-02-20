@@ -16,6 +16,7 @@ from browser_utils import (
     is_server_error,
     human_delay,
     set_reauth_lock,
+    set_headed_mode,
     new_context_and_reauth,
     create_http_session,
     create_http_session_from_cookies,
@@ -26,8 +27,8 @@ from browser_utils import (
 )
 
 # Throttle settings — longer delays to avoid IP blocks
-MIN_DELAY_BETWEEN_ROWS = 4  # minimum seconds between requests
-MAX_DELAY_BETWEEN_ROWS = 10  # maximum seconds between requests
+MIN_DELAY_BETWEEN_ROWS = 1  # minimum seconds between requests
+MAX_DELAY_BETWEEN_ROWS = 5  # maximum seconds between requests
 # Every N rows, take an extra long break to look less bot-like
 LONG_PAUSE_EVERY = 100
 LONG_PAUSE_MIN = 5
@@ -45,13 +46,14 @@ _failed_states = None
 _preauth_cookies = None
 
 
-def _init_worker(counter, failed_states, reauth_lock, preauth_cookies=None):
+def _init_worker(counter, failed_states, reauth_lock, preauth_cookies=None, headed=True):
     """Pool initializer: store shared objects in each worker."""
     global _shared_counter, _failed_states, _preauth_cookies
     _shared_counter = counter
     _failed_states = failed_states
     _preauth_cookies = preauth_cookies
     set_reauth_lock(reauth_lock)
+    set_headed_mode(headed)
 
 
 def _monitor_progress(counter, total, stop_event):
@@ -243,7 +245,7 @@ def _ensure_browser(pw, browser, context, page, state_name):
         f"[BROWSER] PID {os.getpid()} launching headless Firefox for alpha-ID search ({state_name})..."
     )
     pw = sync_playwright().start()
-    browser = _launch_browser(pw)
+    browser = _launch_browser(pw, headed=False)
     context = _new_stealth_context(browser)
     page = context.new_page()
 
@@ -420,8 +422,7 @@ def process_state(state_data):
 
                 # ---- Parse with BeautifulSoup ----
                 mapping = scrape_attachment_mappings_html(html)
-                if mapping:
-                    df_state.at[idx, "form_name_mapping"] = str(mapping)
+                df_state.at[idx, "form_name_mapping"] = str(mapping) if mapping else "{}"
 
             except Exception as e:
                 serf = getattr(row, "serf_num", "unknown")
@@ -483,25 +484,25 @@ def process_state(state_data):
 
 def load_already_processed(output_dir="outputs"):
     """
-    Scan existing temp_results_*.csv files and return a set of serf_num values
-    that have already been fully processed (i.e., have at least one extraction column populated).
+    Scan existing result CSVs and return a set of SERFF Tracking Numbers
+    that have already been fully processed (non-null form_name_mapping).
     Also returns a list of the DataFrames so they can be included in the final merge.
     """
     import glob
 
+    MATCH_COL = "SERFF Tracking Number"
     EXTRACTION_COLS = ["form_name_mapping"]
 
-    processed_serf_nums = set()
+    processed_ids = set()
     processed_dfs = []
 
-    # Look for both per-state CSVs (state_results_*) and chunk checkpoints (temp_results_*)
     existing_files = sorted(
         glob.glob(os.path.join(output_dir, "state_results_*.csv"))
         + glob.glob(os.path.join(output_dir, "temp_results_*.csv"))
     )
 
     if not existing_files:
-        return processed_serf_nums, processed_dfs
+        return processed_ids, processed_dfs
 
     print(
         f"[RESUME] Found {len(existing_files)} existing result files, scanning for already-processed rows..."
@@ -510,28 +511,28 @@ def load_already_processed(output_dir="outputs"):
     for f in existing_files:
         try:
             tmp_df = pd.read_csv(f)
-            if "serf_num" not in tmp_df.columns:
+            if MATCH_COL not in tmp_df.columns:
                 continue
 
-            # Find which extraction columns exist in this file
+            tmp_df[MATCH_COL] = tmp_df[MATCH_COL].astype(str)
+
             available_cols = [c for c in EXTRACTION_COLS if c in tmp_df.columns]
             if not available_cols:
                 continue
 
-            # Rows that have at least one non-null extraction value are "done"
             has_data = tmp_df[available_cols].notna().any(axis=1)
             done_df = tmp_df[has_data]
 
             if len(done_df) > 0:
-                processed_serf_nums.update(done_df["serf_num"].unique())
+                processed_ids.update(done_df[MATCH_COL].unique())
                 processed_dfs.append(done_df)
         except Exception as e:
             print(f"[RESUME][WARN] Could not read {f}: {str(e).splitlines()[0]}")
 
     print(
-        f"[RESUME] {len(processed_serf_nums)} serf_nums already processed — these will be skipped"
+        f"[RESUME] {len(processed_ids)} tracking numbers already processed — these will be skipped"
     )
-    return processed_serf_nums, processed_dfs
+    return processed_ids, processed_dfs
 
 
 def parse_args():
@@ -557,15 +558,16 @@ if __name__ == "__main__":
 
     form_df = pd.read_csv("data/old_data_from_name_fetch_3.csv")
     df = form_df.copy()
+    df["SERFF Tracking Number"] = df["SERFF Tracking Number"].astype(str)
 
     # ------------------------------------------------------------------
-    # RESUME: load already-processed serf_nums and skip them
+    # RESUME: load already-processed tracking numbers and skip them
     # ------------------------------------------------------------------
-    already_done_serf_nums, prev_result_dfs = load_already_processed("outputs")
+    already_done, prev_result_dfs = load_already_processed("outputs")
 
     original_len = len(df)
-    if already_done_serf_nums:
-        df = df[~df["serf_num"].isin(already_done_serf_nums)].reset_index(drop=True)
+    if already_done:
+        df = df[~df["SERFF Tracking Number"].isin(already_done)].reset_index(drop=True)
         print(
             f"[RESUME] Filtered: {original_len} -> {len(df)} rows remaining to process"
         )
@@ -630,7 +632,7 @@ if __name__ == "__main__":
         with Pool(
             actual_procs,
             initializer=_init_worker,
-            initargs=(total_counter, failed_states, reauth_lock, dict(preauth_cookies)),
+            initargs=(total_counter, failed_states, reauth_lock, dict(preauth_cookies), headed),
         ) as pool:
             results = list(pool.imap_unordered(process_state, batch))
 
@@ -655,7 +657,7 @@ if __name__ == "__main__":
         exit(1)
 
     final_df = pd.concat(all_dfs, ignore_index=True)
-    final_df = final_df.drop_duplicates(subset="serf_num", keep="last")
+    final_df = final_df.drop_duplicates(subset="SERFF Tracking Number", keep="last")
     final_df.to_csv("form_names_mapping.csv", index=False)
 
     print(
