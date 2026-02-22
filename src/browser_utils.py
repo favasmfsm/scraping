@@ -18,8 +18,10 @@ Usage (sync API, compatible with multiprocessing):
 """
 
 import os
-import time
+import queue
 import random
+import threading
+import time
 import requests as _requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -282,11 +284,22 @@ def wait_for_server_recovery(page, state_name, attempt=0):
 _CAPTCHA_REAUTH_WAIT = 90  # seconds to wait for user in headed re-auth
 
 
-def _headed_reauth(state_name):
+def _is_verification_screen_body(body_text):
+    """Return True if the page body indicates a human verification/captcha screen."""
+    if not body_text:
+        return False
+    lower = body_text.lower()
+    return (
+        "confirm you are human" in lower
+        or "complete the security check" in lower
+    )
+
+
+def _headed_reauth_impl(state_name):
     """
     Open a temporary headed browser for the user to solve a CAPTCHA.
     Returns cookie list on success, None on timeout.
-    Called while the re-auth lock is held.
+    Must be run in a dedicated thread to avoid "Sync API inside asyncio loop" errors.
     """
     print(f"\n[HEADED] Opening visible browser for {state_name} — solve CAPTCHA...")
     pw = sync_playwright().start()
@@ -363,6 +376,34 @@ def _headed_reauth(state_name):
             pass
 
 
+def _headed_reauth(state_name):
+    """
+    Run headed re-auth in a dedicated thread so sync Playwright is not used
+    inside an asyncio loop (avoids "Sync API inside asyncio loop" in worker processes).
+    Returns cookie list on success, None on timeout.
+    """
+    result_queue = queue.Queue()
+
+    def run():
+        try:
+            cookies = _headed_reauth_impl(state_name)
+            result_queue.put(("ok", cookies))
+        except Exception as e:
+            result_queue.put(("error", e))
+
+    thread = threading.Thread(target=run, daemon=False)
+    thread.start()
+    try:
+        status, value = result_queue.get(timeout=_CAPTCHA_REAUTH_WAIT + 60)
+    except queue.Empty:
+        print("[HEADED] Thread did not return in time")
+        return None
+    if status == "error":
+        print(f"[HEADED] Headed re-auth failed: {value}")
+        return None
+    return value
+
+
 def authenticate(page, state_name, max_retries=5):
     """
     Authenticate for a specific state on SERFF.
@@ -422,12 +463,20 @@ def authenticate(page, state_name, max_retries=5):
                 print(
                     f"[ERROR] Auth failed for {state_name} (attempt {attempt+1}/{max_retries}): {str(e).splitlines()[0]}"
                 )
+                body = None
                 try:
                     print(f"[DEBUG] URL: {page.url}")
                     body = page.inner_text("body")
                     print(f"[DEBUG] Body (first 300 chars): {body[:300]}")
                 except Exception:
                     print(f"[DEBUG] Could not read page content")
+
+                # Verification/captcha screen in headless — open headed and re-auth immediately
+                if body and _is_verification_screen_body(body) and _headed_mode:
+                    print(
+                        "[AUTH] Verification screen detected in headless — opening headed browser for you to complete it."
+                    )
+                    break
 
                 if attempt < max_retries - 1:
                     lo, hi = _AUTH_BACKOFF[min(attempt, len(_AUTH_BACKOFF) - 1)]
