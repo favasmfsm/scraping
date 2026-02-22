@@ -25,6 +25,9 @@ from browser_utils import (
     fetch_page,
     keepalive_session,
     pre_authenticate_all_states,
+    headed_reauth,
+    apply_cookies_to_browser,
+    play_human_verification_alert,
 )
 
 # Throttle settings — longer delays to avoid IP blocks
@@ -95,6 +98,21 @@ def _parse_file_name_column(raw):
         except (ValueError, SyntaxError):
             return [s]
     return [s]
+
+
+def _get_form_name_for_file(f, mapping):
+    """
+    Get form_name for expected filename f from scraped mapping.
+    Tries exact match first, then case-insensitive (e.g. .PDF in CSV vs .pdf on page).
+    Returns form_name string or None if not found.
+    """
+    if f in mapping and mapping[f]:
+        return mapping[f][0].get("form_name") or ""
+    key_lower = f.lower()
+    for k, entries in mapping.items():
+        if k.lower() == key_lower and entries:
+            return entries[0].get("form_name") or ""
+    return None
 
 
 def has_alpha_filing_id(url):
@@ -391,11 +409,52 @@ def process_state(state_data):
                             continue
 
                     if page_html and not expired and not srv_err:
-                        if (
-                            "filingSummary" in url
-                            or "attachmentsContainer" in page_html
-                        ):
+                        if "attachmentsContainer" in page_html:
                             html = page_html
+                        elif "filingSummary" in url:
+                            # Response missing attachmentsContainer (e.g. login/error page) — re-auth and retry once
+                            print(
+                                f"[HTTP] PID {os.getpid()} row {idx}: No attachmentsContainer in response, re-authenticating..."
+                            )
+                            if page_html:
+                                print(f"[HTTP] First 300 chars: {page_html[:300]!r}")
+                            is_human_verification = (
+                                page_html
+                                and "Human Verification" in page_html
+                            )
+                            if is_human_verification:
+                                play_human_verification_alert()
+                                print(
+                                    "[HTTP] Human Verification detected — opening headed browser; please complete verification in the visible window."
+                                )
+                            pw, browser, context, page = _ensure_browser(
+                                pw, browser, context, page, state_name
+                            )
+                            if is_human_verification:
+                                cookies = headed_reauth(state_name)
+                                if cookies:
+                                    context, page = apply_cookies_to_browser(
+                                        browser, cookies, old_context=context
+                                    )
+                                    refresh_http_cookies(context, http_session)
+                                    auth_ok = True
+                                else:
+                                    auth_ok = False
+                            else:
+                                context, page, http_session, auth_ok = _reauth_and_refresh(
+                                    browser, context, page, state_name, http_session
+                                )
+                            if auth_ok:
+                                page_html, expired, srv_err = fetch_page(
+                                    http_session, url
+                                )
+                                if (
+                                    page_html
+                                    and not expired
+                                    and not srv_err
+                                    and "attachmentsContainer" in page_html
+                                ):
+                                    html = page_html
 
                 # ---- Path 2: Alpha IDs or failed direct fetch -> Playwright search ----
                 if html is None:
@@ -453,19 +512,73 @@ def process_state(state_data):
                         df_state.at[idx, "file_name"]
                     )
                 if expected_files:
-                    # Subset: only store form names for the files we care about
-                    subset = {}
-                    for f in expected_files:
-                        if f in mapping and mapping[f]:
-                            # mapping[f] is list of {form_name, form_number, section}; take first
-                            subset[f] = mapping[f][0].get("form_name") or ""
+                    # Subset: only store form names for the files we care about (exact + case-insensitive match)
+                    subset = {
+                        f: _get_form_name_for_file(f, mapping)
+                        for f in expected_files
+                    }
+                    any_found = any(
+                        subset.get(f) is not None for f in expected_files
+                    )
+                    if not any_found:
+                        # One retry: re-auth and re-fetch (whole-run often gets bad responses)
+                        print(
+                            f"[RETRY] PID {os.getpid()} row {idx}: No match, re-auth and re-fetch once..."
+                        )
+                        pw, browser, context, page = _ensure_browser(
+                            pw, browser, context, page, state_name
+                        )
+                        context, page, http_session, _ = _reauth_and_refresh(
+                            browser, context, page, state_name, http_session
+                        )
+                        if not is_alpha:
+                            page_html, expired, srv_err = fetch_page(
+                                http_session, url
+                            )
+                            if (
+                                page_html
+                                and not expired
+                                and not srv_err
+                                and "attachmentsContainer" in page_html
+                            ):
+                                mapping = scrape_attachment_mappings_html(
+                                    page_html
+                                )
+                                subset = {
+                                    f: _get_form_name_for_file(f, mapping)
+                                    for f in expected_files
+                                }
+                                any_found = any(
+                                    subset.get(f) is not None
+                                    for f in expected_files
+                                )
                         else:
-                            subset[f] = None
-                    any_found = any(subset.get(f) is not None for f in expected_files)
+                            if navigate_via_search(
+                                page, context, tracking_number, state_name
+                            ) and not is_server_error(page):
+                                mapping = scrape_attachment_mappings_html(
+                                    page.content()
+                                )
+                                subset = {
+                                    f: _get_form_name_for_file(f, mapping)
+                                    for f in expected_files
+                                }
+                                any_found = any(
+                                    subset.get(f) is not None
+                                    for f in expected_files
+                                )
                     if any_found:
                         df_state.at[idx, "form_name_mapping"] = str(subset)
                     else:
                         # No files found for this row -> NA so it will be rerun (not considered done)
+                        page_loaded = (
+                            html is not None and "Submission Date:" in html
+                        )
+                        print(
+                            f"[NO_MATCH] PID {os.getpid()} row {idx} {tracking_number}: "
+                            f"expected {len(expected_files)} file(s), 0 matched "
+                            f"(page_loaded={page_loaded})"
+                        )
                         df_state.at[idx, "form_name_mapping"] = pd.NA
                 else:
                     # No file_name list: keep full page mapping (backward compat)
@@ -595,7 +708,7 @@ def parse_args():
     parser.add_argument(
         "--workers",
         type=int,
-        default=10,
+        default=12,
         help="Number of parallel worker processes (default: 10)",
     )
     return parser.parse_args()
@@ -606,7 +719,7 @@ if __name__ == "__main__":
     n_proc = args.workers
     headed = not args.headless
 
-    form_df = pd.read_csv("data/final_batch_22_feb_1.csv")
+    form_df = pd.read_csv("data/final_batch_22_feb_2.csv")
     df = form_df.copy()
     df["SERFF Tracking Number"] = df["SERFF Tracking Number"].astype(str)
 

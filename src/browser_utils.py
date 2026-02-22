@@ -20,6 +20,8 @@ Usage (sync API, compatible with multiprocessing):
 import os
 import queue
 import random
+import subprocess
+import sys
 import threading
 import time
 import requests as _requests
@@ -402,6 +404,48 @@ def _headed_reauth(state_name):
         print(f"[HEADED] Headed re-auth failed: {value}")
         return None
     return value
+
+
+def headed_reauth(state_name):
+    """
+    Public wrapper for _headed_reauth. Opens a visible browser for the user to
+    complete Human Verification / CAPTCHA. Returns cookie list on success, None on timeout.
+    """
+    return _headed_reauth(state_name)
+
+
+def play_human_verification_alert():
+    """Play a system sound to alert the user that manual verification is needed."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                check=False,
+                timeout=2,
+                capture_output=True,
+            )
+        else:
+            # Windows: winsound.Beep(1000, 500) would need import; fallback to terminal bell
+            print("\a", end="", flush=True)
+    except Exception:
+        print("\a", end="", flush=True)
+
+
+def apply_cookies_to_browser(browser, cookies, old_context=None):
+    """
+    Close old context (if any), create a new context, add cookies, and return (context, page).
+    Used after headed_reauth() to apply the cookies to the worker's browser.
+    """
+    if old_context:
+        try:
+            old_context.close()
+        except Exception:
+            pass
+    time.sleep(random.uniform(1, 2))
+    context = _new_stealth_context(browser)
+    context.add_cookies(cookies)
+    page = context.new_page()
+    return context, page
 
 
 def authenticate(page, state_name, max_retries=5):
