@@ -20,8 +20,10 @@ Usage (sync API, compatible with multiprocessing):
 import os
 import queue
 import random
+import re
 import subprocess
 import sys
+from typing import Optional
 import threading
 import time
 import requests as _requests
@@ -137,6 +139,9 @@ _AUTH_BACKOFF = [(10, 20), (30, 90), (60, 180), (120, 300)]
 
 # Global re-auth lock — set by worker initializer via set_reauth_lock()
 _reauth_lock = None
+# Max seconds to wait for the lock (another worker may be hung in authenticate).
+# 0 means wait indefinitely (legacy). Default avoids permanent cross-worker deadlock.
+_reauth_lock_timeout_sec = 600
 
 # When True, all browser launches are headed (visible) so the user can
 # solve CAPTCHAs.  Set via set_headed_mode() in worker initializer.
@@ -147,6 +152,12 @@ def set_reauth_lock(lock):
     """Set the global re-auth lock (called from worker initializer)."""
     global _reauth_lock
     _reauth_lock = lock
+
+
+def set_reauth_lock_timeout(seconds):
+    """Set max wait for re-auth lock (0 = block forever). Called from worker initializer."""
+    global _reauth_lock_timeout_sec
+    _reauth_lock_timeout_sec = max(0, int(seconds))
 
 
 def set_headed_mode(headed):
@@ -321,10 +332,13 @@ def _headed_reauth_impl(state_name):
             begin.wait_for(state="visible", timeout=8000)
             begin.click(timeout=5000)
             human_delay(0.5, 1.0)
-            accept = page.locator("span:has-text('Accept')")
+            accept = page.locator("button:has-text('Accept')")
             accept.wait_for(state="visible", timeout=8000)
-            accept.click(timeout=5000)
-            page.wait_for_load_state("networkidle", timeout=10000)
+            accept.click(timeout=5000, no_wait_after=True)
+            try:
+                page.wait_for_url("**/filingSearch*", timeout=10000)
+            except Exception:
+                page.wait_for_load_state("networkidle", timeout=10000)
             if "filingSearch" in page.url:
                 cookies = context.cookies()
                 print(f"[HEADED] {state_name} authenticated (no CAPTCHA)")
@@ -350,11 +364,14 @@ def _headed_reauth_impl(state_name):
                 if begin.is_visible():
                     begin.click(timeout=5000)
                     human_delay(0.5, 1.0)
-                    accept = page.locator("span:has-text('Accept')")
+                    accept = page.locator("button:has-text('Accept')")
                     try:
                         accept.wait_for(state="visible", timeout=10000)
-                        accept.click(timeout=5000)
-                        page.wait_for_load_state("networkidle", timeout=10000)
+                        accept.click(timeout=5000, no_wait_after=True)
+                        try:
+                            page.wait_for_url("**/filingSearch*", timeout=10000)
+                        except Exception:
+                            page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass
                     if "filingSearch" in page.url:
@@ -448,27 +465,39 @@ def apply_cookies_to_browser(browser, cookies, old_context=None):
     return context, page
 
 
-def authenticate(page, state_name, max_retries=5):
+def authenticate(page, state_name, max_retries=3):
     """
     Authenticate for a specific state on SERFF.
 
     Uses a global lock so only one worker re-authenticates at a time.
     Retries use jittered exponential backoff.
 
-    If all headless retries fail and _headed_mode is True, opens a
-    visible browser for the user to solve the CAPTCHA, then applies
-    cookies back to the caller's context.
+    If retries fail and a verification screen was detected, opens a visible
+    browser for the user to solve CAPTCHA, then applies cookies back to the
+    caller's context.
 
     Returns True if successful, False otherwise.
     """
     auth_url = f"https://filingaccess.serff.com/sfa/home/{state_name}"
 
     lock = _reauth_lock
+    lock_acquired = False
     if lock:
-        lock.acquire()
+        to = _reauth_lock_timeout_sec
+        if to and to > 0:
+            if not lock.acquire(timeout=to):
+                print(
+                    f"[LOCK] PID {os.getpid()} timed out after {to}s waiting for re-auth lock "
+                    f"(another worker may be hung) — skipping auth for {state_name}"
+                )
+                return False
+        else:
+            lock.acquire()
+        lock_acquired = True
         print(f"[LOCK] PID {os.getpid()} acquired re-auth lock for {state_name}")
 
     try:
+        verification_screen_seen = False
         for attempt in range(max_retries):
             try:
                 page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
@@ -490,15 +519,20 @@ def authenticate(page, state_name, max_retries=5):
                 begin_btn.click(timeout=10000)
                 human_delay(1.0, 2.5)
 
-                accept_btn = page.locator("span:has-text('Accept')")
+                # Accept is a PrimeFaces button: AJAX submit, not full page nav — do not wait for navigation on click
+                accept_btn = page.locator("button:has-text('Accept')")
                 accept_btn.wait_for(state="visible", timeout=20000)
                 human_delay(0.3, 1.0)
-                accept_btn.click(timeout=10000)
+                accept_btn.click(timeout=10000, no_wait_after=True)
 
+                # Wait for redirect to search page (AJAX completes then navigates)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
+                    page.wait_for_url("**/filingSearch*", timeout=15000)
                 except Exception:
-                    pass
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                    except Exception:
+                        pass
                 human_delay(1.0, 2.5)
                 print(f"[AUTH] PID {os.getpid()} authenticated for {state_name}")
                 return True
@@ -516,7 +550,9 @@ def authenticate(page, state_name, max_retries=5):
                     print(f"[DEBUG] Could not read page content")
 
                 # Verification/captcha screen in headless — open headed and re-auth immediately
-                if body and _is_verification_screen_body(body) and _headed_mode:
+                if body and _is_verification_screen_body(body):
+                    verification_screen_seen = True
+                if verification_screen_seen:
                     print(
                         "[AUTH] Verification screen detected in headless — opening headed browser for you to complete it."
                     )
@@ -528,8 +564,8 @@ def authenticate(page, state_name, max_retries=5):
                     print(f"[BACKOFF] Waiting {wait:.0f}s before retry...")
                     time.sleep(wait)
 
-        # All headless retries exhausted — try headed if enabled
-        if _headed_mode:
+        # Open headed browser when verification/captcha is detected.
+        if verification_screen_seen:
             cookies = _headed_reauth(state_name)
             if cookies:
                 page.context.add_cookies(cookies)
@@ -546,7 +582,7 @@ def authenticate(page, state_name, max_retries=5):
         )
         return False
     finally:
-        if lock:
+        if lock and lock_acquired:
             lock.release()
             print(f"[LOCK] PID {os.getpid()} released re-auth lock for {state_name}")
 
@@ -705,11 +741,14 @@ def _poll_for_search_page(page, context, state, deadline):
             if begin.is_visible():
                 begin.click(timeout=5000)
                 human_delay(0.5, 1.0)
-                accept = page.locator("span:has-text('Accept')")
+                accept = page.locator("button:has-text('Accept')")
                 try:
                     accept.wait_for(state="visible", timeout=10000)
-                    accept.click(timeout=5000)
-                    page.wait_for_load_state("networkidle", timeout=10000)
+                    accept.click(timeout=5000, no_wait_after=True)
+                    try:
+                        page.wait_for_url("**/filingSearch*", timeout=10000)
+                    except Exception:
+                        page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
                     pass
                 if "filingSearch" in page.url:
@@ -777,7 +816,7 @@ def pre_authenticate_all_states(states, headed=True):
                     pass
                 context = _new_stealth_context(browser)
                 page = context.new_page()
-                ok = authenticate(page, state, max_retries=5)
+                ok = authenticate(page, state)
                 if ok:
                     all_cookies[state] = context.cookies()
                     print(f"OK ({len(all_cookies[state])} cookies) [backoff]")
@@ -982,6 +1021,317 @@ def wait_for_ajax(page):
         page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# NAIC / Interstate Insurance Compact (Appian SERFF Filing Access)
+# ---------------------------------------------------------------------------
+
+NAIC_SERFF_URL = "https://portals.naic.org/serff-filing-access"
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def is_interstate_insurance_compact_page(html: str) -> bool:
+    """True if filing summary HTML indicates an Interstate Insurance Compact filing."""
+    if not html:
+        return False
+    return "interstate insurance compact" in html.lower()
+
+
+def _naic_soft_click_button(page, name_pat, timeout: int = 30_000):
+    """
+    Scroll into view, move mouse with steps, then click (no force).
+    Intended for Begin Search / Accept to reduce bot-detection friction.
+    """
+    btn = page.get_by_role("button", name=name_pat).first
+    btn.wait_for(state="visible", timeout=timeout)
+    btn.scroll_into_view_if_needed(timeout=10_000)
+    human_delay(0.4, 1.0)
+    box = btn.bounding_box()
+    if box:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        page.mouse.move(x, y, steps=10)
+        human_delay(0.06, 0.18)
+    click_delay = int(random.uniform(80, 180))
+    btn.click(timeout=timeout, delay=click_delay)
+
+
+def _download_zip_naic_on_page(
+    page,
+    tracking_number,
+    zip_file_path,
+    *,
+    manual_login_seconds: float = 0,
+    expect_download_timeout_ms: int = 180_000,
+    zip_ready_timeout_s: float = 300.0,
+) -> Optional[str]:
+    """Core NAIC Appian flow on an existing page (see download_zip_via_naic_portal)."""
+    tracking_number = str(tracking_number).strip()
+    if not tracking_number:
+        return None
+
+    os.makedirs(os.path.dirname(os.path.abspath(zip_file_path)) or ".", exist_ok=True)
+    temp_zip = f"{zip_file_path}.part"
+
+    try:
+        ensure_single_tab(page.context, page)
+        page.goto(NAIC_SERFF_URL, wait_until="domcontentloaded", timeout=60_000)
+        human_delay(0.6, 1.5)
+        if manual_login_seconds and manual_login_seconds > 0:
+            time.sleep(float(manual_login_seconds))
+
+        _naic_soft_click_button(page, re.compile(r"Begin Search", re.I))
+        human_delay(1.0, 2.0)
+        _naic_soft_click_button(page, re.compile(r"Accept", re.I))
+        human_delay(1.0, 2.0)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception:
+            pass
+
+        serff_input = page.get_by_label(re.compile(r"SERFF\s+Tracking\s+Number", re.I))
+        if serff_input.count() == 0:
+            serff_input = page.get_by_placeholder(
+                re.compile(r"Search\s+by\s+.*Tracking\s+Number", re.I)
+            )
+        if serff_input.count() == 0:
+            print("[NAIC] SERFF Tracking Number input not found")
+            return None
+        serff_input.first.wait_for(state="visible", timeout=30_000)
+        serff_input.first.fill("")
+        serff_input.first.fill(tracking_number)
+        human_delay(0.3, 0.7)
+
+        combo = page.get_by_role(
+            "combobox", name=re.compile(r"Type\s+of\s+Insurance", re.I)
+        )
+        combo.wait_for(state="visible", timeout=30_000)
+        combo.click()
+        human_delay(0.25, 0.45)
+        combo.fill("")
+        combo.press_sequentially("health", delay=35)
+        human_delay(0.35, 0.65)
+
+        health_pat = re.compile(r"health", re.I)
+        max_health_picks = 50
+        for _ in range(max_health_picks):
+            opts = page.get_by_role("option").filter(has_text=health_pat)
+            if opts.count() == 0:
+                break
+            opts.first.click(timeout=10_000)
+            human_delay(0.15, 0.35)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        human_delay(0.2, 0.4)
+
+        search_btn = page.get_by_role("button").filter(
+            has_text=re.compile(r"^\s*Search\s*$", re.I)
+        )
+        if search_btn.count() == 0:
+            search_btn = page.locator(
+                'button:has(svg[data-owl-icon-name="search"]):has-text("Search")'
+            )
+        if search_btn.count() == 0:
+            print("[NAIC] Search button not found")
+            return None
+        search_btn.first.wait_for(state="visible", timeout=15_000)
+        search_btn.first.click(timeout=15_000)
+        human_delay(1.0, 2.0)
+        try:
+            page.wait_for_load_state("networkidle", timeout=25_000)
+        except Exception:
+            pass
+
+        rows_match = page.locator("tbody tr").filter(
+            has_text=re.compile(re.escape(tracking_number))
+        )
+        if rows_match.count() > 0:
+            result_link = rows_match.first.locator("a.LinkedItem---richtext_link")
+        else:
+            result_link = page.locator(
+                "tbody tr a.LinkedItem---richtext_link"
+            ).first
+        result_link.wait_for(state="visible", timeout=45_000)
+        result_link.click(timeout=15_000)
+        human_delay(1.0, 2.0)
+        try:
+            page.wait_for_load_state("networkidle", timeout=25_000)
+        except Exception:
+            pass
+
+        gen_btn = page.get_by_role(
+            "button", name=re.compile(r"Generate\s+Zip\s+to\s+Download", re.I)
+        )
+        gen_btn.first.wait_for(state="visible", timeout=30_000)
+        gen_btn.first.click(timeout=15_000)
+        human_delay(0.5, 1.0)
+
+        dl_link = page.get_by_role(
+            "link", name=re.compile(r"DOWNLOAD\s+THIS\s+FILING", re.I)
+        )
+        deadline = time.time() + zip_ready_timeout_s
+        href_ok = ""
+        while time.time() < deadline:
+            if dl_link.count() > 0:
+                try:
+                    h = dl_link.first.get_attribute("href") or ""
+                except Exception:
+                    h = ""
+                if h.startswith("https://"):
+                    href_ok = h
+                    break
+            time.sleep(0.75)
+
+        if not href_ok:
+            print("[NAIC] Timed out waiting for presigned DOWNLOAD THIS FILING link")
+            return None
+
+        if os.path.exists(temp_zip):
+            try:
+                os.remove(temp_zip)
+            except OSError:
+                pass
+
+        with page.expect_download(timeout=expect_download_timeout_ms) as dl_info:
+            dl_link.first.click(timeout=30_000)
+        download = dl_info.value
+        download.save_as(temp_zip)
+        os.replace(temp_zip, zip_file_path)
+
+        if os.path.exists(zip_file_path) and os.path.getsize(zip_file_path) > 0:
+            return zip_file_path
+        return None
+
+    except PlaywrightTimeout as e:
+        print(f"[NAIC] Timeout: {str(e).splitlines()[0]}")
+        return None
+    except Exception as e:
+        print(f"[NAIC] Failed: {str(e).splitlines()[0]}")
+        return None
+    finally:
+        if os.path.exists(temp_zip):
+            try:
+                if not os.path.exists(zip_file_path) or os.path.getsize(zip_file_path) == 0:
+                    pass  # leave .part for debugging
+                else:
+                    os.remove(temp_zip)
+            except OSError:
+                pass
+
+
+def download_zip_via_naic_portal(
+    page,
+    tracking_number,
+    zip_file_path,
+    *,
+    manual_login_seconds: float = 0,
+    expect_download_timeout_ms: int = 180_000,
+    zip_ready_timeout_s: float = 300.0,
+    storage_state_path: Optional[str] = None,
+    use_chromium: Optional[bool] = None,
+) -> Optional[str]:
+    """
+    On portals.naic.org (Appian), search by SERFF tracking number, filter
+    Type of Insurance to options containing 'health', open the first result,
+    generate the zip, and save the download to *zip_file_path*.
+
+    Begin Search / Accept use softer mouse movement and delayed clicks (no force).
+
+    **Non-interactive session trust (optional):**
+    - ``NAIC_STORAGE_STATE_PATH``: path to Playwright ``storage_state`` JSON.
+      When the file exists, NAIC runs in a **new** browser context loaded with
+      that state (same browser type as *page*, unless Chromium is requested).
+    - ``NAIC_USE_CHROMIUM`` (``1``/``true``/``yes``): run the NAIC flow in a
+      separate Chromium instance (optional ``NAIC_CHROME_CHANNEL``, e.g. ``chrome``).
+    Kwargs ``storage_state_path`` / ``use_chromium`` override env when not None.
+
+    Returns the saved path on success, or None on failure.
+    """
+    raw_storage = (
+        storage_state_path
+        if storage_state_path is not None
+        else os.environ.get("NAIC_STORAGE_STATE_PATH", "")
+    )
+    path_storage = (raw_storage or "").strip()
+    if path_storage and not os.path.isfile(path_storage):
+        print(f"[NAIC] storage state file not found: {path_storage!r}")
+        path_storage = ""
+
+    if use_chromium is None:
+        use_chromium = _env_flag("NAIC_USE_CHROMIUM")
+
+    naic_page = page
+    cleanup_ctx = None
+    cleanup_browser = None
+    cleanup_pw = None
+
+    try:
+        if use_chromium:
+            pw = sync_playwright().start()
+            cleanup_pw = pw
+            channel = (os.environ.get("NAIC_CHROME_CHANNEL") or "").strip() or None
+            headless = not _headed_mode
+            ch_args = ["--disable-blink-features=AutomationControlled"]
+            if sys.platform == "linux":
+                ch_args.extend(
+                    ["--no-sandbox", "--disable-dev-shm-usage"]
+                )
+            cleanup_browser = pw.chromium.launch(
+                headless=headless, channel=channel, args=ch_args
+            )
+            ctx_kw = {
+                "accept_downloads": True,
+                "locale": "en-US",
+                "viewport": {"width": 1400, "height": 900},
+            }
+            if path_storage:
+                ctx_kw["storage_state"] = path_storage
+            cleanup_ctx = cleanup_browser.new_context(**ctx_kw)
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            naic_page = cleanup_ctx.new_page()
+        elif path_storage:
+            browser = page.context.browser
+            vp = page.viewport_size
+            cleanup_ctx = browser.new_context(
+                accept_downloads=True,
+                storage_state=path_storage,
+                locale="en-US",
+                viewport=vp or {"width": 1280, "height": 720},
+            )
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            naic_page = cleanup_ctx.new_page()
+
+        return _download_zip_naic_on_page(
+            naic_page,
+            tracking_number,
+            zip_file_path,
+            manual_login_seconds=manual_login_seconds,
+            expect_download_timeout_ms=expect_download_timeout_ms,
+            zip_ready_timeout_s=zip_ready_timeout_s,
+        )
+    finally:
+        if cleanup_ctx is not None:
+            try:
+                cleanup_ctx.close()
+            except Exception:
+                pass
+        if cleanup_browser is not None:
+            try:
+                cleanup_browser.close()
+            except Exception:
+                pass
+        if cleanup_pw is not None:
+            try:
+                cleanup_pw.stop()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

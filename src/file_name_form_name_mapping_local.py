@@ -46,7 +46,9 @@ _failed_states = None
 _preauth_cookies = None
 
 
-def _init_worker(counter, failed_states, reauth_lock, preauth_cookies=None, headed=True):
+def _init_worker(
+    counter, failed_states, reauth_lock, preauth_cookies=None, headed=True
+):
     """Pool initializer: store shared objects in each worker."""
     global _shared_counter, _failed_states, _preauth_cookies
     _shared_counter = counter
@@ -422,7 +424,9 @@ def process_state(state_data):
 
                 # ---- Parse with BeautifulSoup ----
                 mapping = scrape_attachment_mappings_html(html)
-                df_state.at[idx, "form_name_mapping"] = str(mapping) if mapping else "{}"
+                df_state.at[idx, "form_name_mapping"] = (
+                    str(mapping) if mapping else "{}"
+                )
 
             except Exception as e:
                 serf = getattr(row, "serf_num", "unknown")
@@ -556,7 +560,7 @@ if __name__ == "__main__":
     n_proc = args.workers
     headed = not args.headless
 
-    form_df = pd.read_csv("data/old_data_from_name_fetch_3.csv")
+    form_df = pd.read_csv("data/old_data_from_name_fetch_4.csv")
     df = form_df.copy()
     df["SERFF Tracking Number"] = df["SERFF Tracking Number"].astype(str)
 
@@ -632,7 +636,13 @@ if __name__ == "__main__":
         with Pool(
             actual_procs,
             initializer=_init_worker,
-            initargs=(total_counter, failed_states, reauth_lock, dict(preauth_cookies), headed),
+            initargs=(
+                total_counter,
+                failed_states,
+                reauth_lock,
+                dict(preauth_cookies),
+                headed,
+            ),
         ) as pool:
             results = list(pool.imap_unordered(process_state, batch))
 

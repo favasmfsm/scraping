@@ -1,0 +1,1 @@
+python src/all_details_scrape.py --headless

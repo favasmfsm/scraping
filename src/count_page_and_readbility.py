@@ -1,11 +1,9 @@
 import pandas as pd
 import numpy as np
 import os
-import re
 import time
 import shutil
 import tempfile
-import zipfile
 from urllib.parse import unquote
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
@@ -16,6 +14,12 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import fitz  # PyMuPDF
+
+from zip_utils import (
+    extract_toc_form_names,
+    extract_readability_text,
+    process_subfolder_files,
+)
 
 BASE_DIR = "downloads"
 
@@ -78,144 +82,7 @@ def cleanup_chrome_cache(current_user_data_dir=None):
         )
 
 
-def is_form_number(text):
-    """
-    Check if a line looks like a form number rather than a form name.
-    Form numbers typically have patterns like:
-    - SML-LTD-MP-CO (uppercase with dashes)
-    - 0013252XX 01/2015 (numbers with XX pattern)
-    - 0006017XX 06/2010
-    """
-    # Pattern 1: All uppercase with dashes (e.g., SML-LTD-MP-CO)
-    if re.match(r"^[A-Z0-9\-]+$", text) and "-" in text:
-        return True
-
-    # Pattern 2: Contains XX followed by space and date (e.g., "0013252XX 01/2015")
-    if re.match(r"^\d+XX\s+\d{2}/\d{4}$", text):
-        return True
-
-    # Pattern 3: Just numbers and XX (e.g., "0006017XX")
-    if re.match(r"^\d+XX$", text):
-        return True
-
-    return False
-
-
-def extract_toc_form_names(root_pdf_path):
-    """
-    Extract form name mappings from the Table of Contents on page 1 of the root PDF.
-    Returns dict: {filename: form_name}
-
-    The TOC structure is:
-    - Form Attachments section: Form Name | Form Number | filename.pdf
-    - Supporting Document section: Document Name | filename.pdf
-    """
-    toc_mapping = {}
-
-    try:
-        pdf = fitz.open(root_pdf_path)
-        page = pdf[0]  # First page
-        text = page.get_text()
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-        # Find all .pdf filenames and map to preceding form name
-        for i, line in enumerate(lines):
-            if line.endswith(".pdf"):
-                filename = line
-                # Look backwards for form name (skip form numbers, headers)
-                for j in range(i - 1, max(0, i - 5), -1):
-                    prev_line = lines[j]
-                    # Skip: filenames, section headers, format hints, form numbers
-                    if (
-                        not prev_line.endswith(".pdf")
-                        and "Attachments" not in prev_line
-                        and "(ex." not in prev_line
-                        and prev_line
-                        not in [
-                            "Form Attachments",
-                            "Supporting Document",
-                            "User Usage Agreement",
-                        ]
-                        and not prev_line.startswith("SERFF Tracking")
-                        and not prev_line.startswith("State Tracking")
-                        and not prev_line.startswith("Company Tracking")
-                        and not is_form_number(prev_line)
-                    ):
-                        toc_mapping[filename] = prev_line
-                        break
-
-        pdf.close()
-    except Exception as e:
-        print(f"[WARN] Could not extract TOC from {root_pdf_path}: {e}")
-
-    return toc_mapping
-
-
-def process_subfolder_files(subfolder_path):
-    """
-    Process all files in a subfolder and return file info dict.
-    Returns dict: {filename: page_count (for PDFs) or file_extension (for non-PDFs)}
-    """
-    file_info = {}
-
-    try:
-        for filename in os.listdir(subfolder_path):
-            file_path = os.path.join(subfolder_path, filename)
-
-            if not os.path.isfile(file_path):
-                continue
-
-            if filename.lower().endswith(".pdf"):
-                # Get page count for PDFs
-                try:
-                    pdf = fitz.open(file_path)
-                    file_info[filename] = len(pdf)
-                    pdf.close()
-                except Exception as e:
-                    print(f"[WARN] Could not read PDF {filename}: {e}")
-                    file_info[filename] = 0
-            else:
-                # Store file extension for non-PDFs
-                ext = os.path.splitext(filename)[1].lstrip(".")
-                file_info[filename] = ext if ext else "unknown"
-    except Exception as e:
-        print(f"[ERROR] Failed to process subfolder {subfolder_path}: {e}")
-
-    return file_info
-
-
-def extract_readability_text(extract_dir, ignore_folders):
-    """
-    Extract text from PDFs with 'read' or 'flesch' in the filename.
-    Returns dict: {filename: extracted_text}
-    """
-    readability_texts = {}
-
-    for subfolder in os.listdir(extract_dir):
-        subfolder_path = os.path.join(extract_dir, subfolder)
-
-        if subfolder in ignore_folders or not os.path.isdir(subfolder_path):
-            continue
-
-        for filename in os.listdir(subfolder_path):
-            name_lower = filename.lower()
-
-            if (
-                "read" in name_lower or "flesch" in name_lower
-            ) and filename.lower().endswith(".pdf"):
-                file_path = os.path.join(subfolder_path, filename)
-                try:
-                    pdf = fitz.open(file_path)
-                    text = ""
-                    for page in pdf:
-                        text += page.get_text() or ""
-                    pdf.close()
-                    readability_texts[filename] = text
-                except Exception as e:
-                    print(f"[WARN] Could not extract text from {filename}: {e}")
-                    readability_texts[filename] = None
-
-    return readability_texts
+BASE_DIR = "downloads"
 
 
 def process_state(state_data):

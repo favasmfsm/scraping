@@ -15,8 +15,11 @@ AWS-specific features:
 
 import os
 import random
+import re
 import shutil
 import time
+from typing import Optional
+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
@@ -209,6 +212,11 @@ def ensure_single_tab(context, page):
                 p.close()
             except Exception:
                 pass
+
+
+def human_delay(low=0.5, high=2.0):
+    """Small random delay to mimic human interaction timing."""
+    time.sleep(random.uniform(low, high))
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +501,311 @@ def wait_for_ajax(page):
         page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# NAIC / Interstate Insurance Compact (Appian SERFF Filing Access)
+# ---------------------------------------------------------------------------
+
+NAIC_SERFF_URL = "https://portals.naic.org/serff-filing-access"
+
+_CHROMIUM_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+]
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def is_interstate_insurance_compact_page(html: str) -> bool:
+    """True if filing summary HTML indicates an Interstate Insurance Compact filing."""
+    if not html:
+        return False
+    return "interstate insurance compact" in html.lower()
+
+
+def _naic_soft_click_button(page, name_pat, timeout: int = 30_000):
+    """
+    Scroll into view, move mouse with steps, then click (no force).
+    Intended for Begin Search / Accept to reduce bot-detection friction.
+    """
+    btn = page.get_by_role("button", name=name_pat).first
+    btn.wait_for(state="visible", timeout=timeout)
+    btn.scroll_into_view_if_needed(timeout=10_000)
+    human_delay(0.4, 1.0)
+    box = btn.bounding_box()
+    if box:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        page.mouse.move(x, y, steps=10)
+        human_delay(0.06, 0.18)
+    click_delay = int(random.uniform(80, 180))
+    btn.click(timeout=timeout, delay=click_delay)
+
+
+def _download_zip_naic_on_page(
+    page,
+    tracking_number,
+    zip_file_path,
+    *,
+    manual_login_seconds: float = 0,
+    expect_download_timeout_ms: int = 180_000,
+    zip_ready_timeout_s: float = 300.0,
+) -> Optional[str]:
+    """Core NAIC Appian flow on an existing page (see download_zip_via_naic_portal)."""
+    tracking_number = str(tracking_number).strip()
+    if not tracking_number:
+        return None
+
+    os.makedirs(os.path.dirname(os.path.abspath(zip_file_path)) or ".", exist_ok=True)
+    temp_zip = f"{zip_file_path}.part"
+
+    try:
+        ensure_single_tab(page.context, page)
+        page.goto(NAIC_SERFF_URL, wait_until="domcontentloaded", timeout=60_000)
+        human_delay(0.6, 1.5)
+        if manual_login_seconds and manual_login_seconds > 0:
+            time.sleep(float(manual_login_seconds))
+
+        _naic_soft_click_button(page, re.compile(r"Begin Search", re.I))
+        human_delay(1.0, 2.0)
+        _naic_soft_click_button(page, re.compile(r"Accept", re.I))
+        human_delay(1.0, 2.0)
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception:
+            pass
+
+        serff_input = page.get_by_label(re.compile(r"SERFF\s+Tracking\s+Number", re.I))
+        if serff_input.count() == 0:
+            serff_input = page.get_by_placeholder(
+                re.compile(r"Search\s+by\s+.*Tracking\s+Number", re.I)
+            )
+        if serff_input.count() == 0:
+            print("[NAIC] SERFF Tracking Number input not found")
+            return None
+        serff_input.first.wait_for(state="visible", timeout=30_000)
+        serff_input.first.fill("")
+        serff_input.first.fill(tracking_number)
+        human_delay(0.3, 0.7)
+
+        combo = page.get_by_role(
+            "combobox", name=re.compile(r"Type\s+of\s+Insurance", re.I)
+        )
+        combo.wait_for(state="visible", timeout=30_000)
+        combo.click()
+        human_delay(0.25, 0.45)
+        combo.fill("")
+        combo.press_sequentially("health", delay=35)
+        human_delay(0.35, 0.65)
+
+        health_pat = re.compile(r"health", re.I)
+        max_health_picks = 50
+        for _ in range(max_health_picks):
+            opts = page.get_by_role("option").filter(has_text=health_pat)
+            if opts.count() == 0:
+                break
+            opts.first.click(timeout=10_000)
+            human_delay(0.15, 0.35)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        human_delay(0.2, 0.4)
+
+        search_btn = page.get_by_role("button").filter(
+            has_text=re.compile(r"^\s*Search\s*$", re.I)
+        )
+        if search_btn.count() == 0:
+            search_btn = page.locator(
+                'button:has(svg[data-owl-icon-name="search"]):has-text("Search")'
+            )
+        if search_btn.count() == 0:
+            print("[NAIC] Search button not found")
+            return None
+        search_btn.first.wait_for(state="visible", timeout=15_000)
+        search_btn.first.click(timeout=15_000)
+        human_delay(1.0, 2.0)
+        try:
+            page.wait_for_load_state("networkidle", timeout=25_000)
+        except Exception:
+            pass
+
+        rows_match = page.locator("tbody tr").filter(
+            has_text=re.compile(re.escape(tracking_number))
+        )
+        if rows_match.count() > 0:
+            result_link = rows_match.first.locator("a.LinkedItem---richtext_link")
+        else:
+            result_link = page.locator(
+                "tbody tr a.LinkedItem---richtext_link"
+            ).first
+        result_link.wait_for(state="visible", timeout=45_000)
+        result_link.click(timeout=15_000)
+        human_delay(1.0, 2.0)
+        try:
+            page.wait_for_load_state("networkidle", timeout=25_000)
+        except Exception:
+            pass
+
+        gen_btn = page.get_by_role(
+            "button", name=re.compile(r"Generate\s+Zip\s+to\s+Download", re.I)
+        )
+        gen_btn.first.wait_for(state="visible", timeout=30_000)
+        gen_btn.first.click(timeout=15_000)
+        human_delay(0.5, 1.0)
+
+        dl_link = page.get_by_role(
+            "link", name=re.compile(r"DOWNLOAD\s+THIS\s+FILING", re.I)
+        )
+        deadline = time.time() + zip_ready_timeout_s
+        href_ok = ""
+        while time.time() < deadline:
+            if dl_link.count() > 0:
+                try:
+                    h = dl_link.first.get_attribute("href") or ""
+                except Exception:
+                    h = ""
+                if h.startswith("https://"):
+                    href_ok = h
+                    break
+            time.sleep(0.75)
+
+        if not href_ok:
+            print("[NAIC] Timed out waiting for presigned DOWNLOAD THIS FILING link")
+            return None
+
+        if os.path.exists(temp_zip):
+            try:
+                os.remove(temp_zip)
+            except OSError:
+                pass
+
+        with page.expect_download(timeout=expect_download_timeout_ms) as dl_info:
+            dl_link.first.click(timeout=30_000)
+        download = dl_info.value
+        download.save_as(temp_zip)
+        os.replace(temp_zip, zip_file_path)
+
+        if os.path.exists(zip_file_path) and os.path.getsize(zip_file_path) > 0:
+            return zip_file_path
+        return None
+
+    except PlaywrightTimeout as e:
+        print(f"[NAIC] Timeout: {str(e).splitlines()[0]}")
+        return None
+    except Exception as e:
+        print(f"[NAIC] Failed: {str(e).splitlines()[0]}")
+        return None
+    finally:
+        if os.path.exists(temp_zip):
+            try:
+                if not os.path.exists(zip_file_path) or os.path.getsize(zip_file_path) == 0:
+                    pass
+                else:
+                    os.remove(temp_zip)
+            except OSError:
+                pass
+
+
+def download_zip_via_naic_portal(
+    page,
+    tracking_number,
+    zip_file_path,
+    *,
+    manual_login_seconds: float = 0,
+    expect_download_timeout_ms: int = 180_000,
+    zip_ready_timeout_s: float = 300.0,
+    storage_state_path: Optional[str] = None,
+    use_chromium: Optional[bool] = None,
+) -> Optional[str]:
+    """
+    Same behavior as local browser_utils.download_zip_via_naic_portal.
+
+    AWS: optional ``NAIC_HEADED=1`` uses a visible Chromium window when
+    ``NAIC_USE_CHROMIUM`` spins up a dedicated browser (default headless on EC2).
+    """
+    raw_storage = (
+        storage_state_path
+        if storage_state_path is not None
+        else os.environ.get("NAIC_STORAGE_STATE_PATH", "")
+    )
+    path_storage = (raw_storage or "").strip()
+    if path_storage and not os.path.isfile(path_storage):
+        print(f"[NAIC] storage state file not found: {path_storage!r}")
+        path_storage = ""
+
+    if use_chromium is None:
+        use_chromium = _env_flag("NAIC_USE_CHROMIUM")
+
+    naic_page = page
+    cleanup_ctx = None
+    cleanup_browser = None
+    cleanup_pw = None
+
+    try:
+        if use_chromium:
+            pw = sync_playwright().start()
+            cleanup_pw = pw
+            channel = (os.environ.get("NAIC_CHROME_CHANNEL") or "").strip() or None
+            headless = not _env_flag("NAIC_HEADED")
+            cleanup_browser = pw.chromium.launch(
+                headless=headless,
+                channel=channel,
+                args=list(_CHROMIUM_LAUNCH_ARGS),
+            )
+            ctx_kw = {
+                "accept_downloads": True,
+                "locale": "en-US",
+                "user_agent": _USER_AGENT,
+                "viewport": {"width": 1400, "height": 900},
+            }
+            if path_storage:
+                ctx_kw["storage_state"] = path_storage
+            cleanup_ctx = cleanup_browser.new_context(**ctx_kw)
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            naic_page = cleanup_ctx.new_page()
+        elif path_storage:
+            browser = page.context.browser
+            vp = page.viewport_size
+            cleanup_ctx = browser.new_context(
+                accept_downloads=True,
+                storage_state=path_storage,
+                locale="en-US",
+                user_agent=_USER_AGENT,
+                viewport=vp or {"width": 1920, "height": 1080},
+            )
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            naic_page = cleanup_ctx.new_page()
+
+        return _download_zip_naic_on_page(
+            naic_page,
+            tracking_number,
+            zip_file_path,
+            manual_login_seconds=manual_login_seconds,
+            expect_download_timeout_ms=expect_download_timeout_ms,
+            zip_ready_timeout_s=zip_ready_timeout_s,
+        )
+    finally:
+        if cleanup_ctx is not None:
+            try:
+                cleanup_ctx.close()
+            except Exception:
+                pass
+        if cleanup_browser is not None:
+            try:
+                cleanup_browser.close()
+            except Exception:
+                pass
+        if cleanup_pw is not None:
+            try:
+                cleanup_pw.stop()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
