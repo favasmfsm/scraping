@@ -1,5 +1,6 @@
 import argparse
 import ast
+from collections import deque, namedtuple
 from datetime import datetime
 import pandas as pd
 import os
@@ -59,6 +60,20 @@ _with_zip = False
 
 # Per-row wall-clock limit (worker processes only). Set in _init_worker. 0 = disabled.
 _ROW_TIMEOUT_SEC = 0
+
+# State-level abort (rolling success window + optional wall budget). Set in _init_worker.
+_STATE_ABORT_WINDOW = 0  # 0 = disabled; else deque maxlen
+_STATE_ABORT_MIN_SUCCESS_PCT = 20.0
+_STATE_MAX_WALL_SEC = 0  # 0 = disabled
+# Consecutive rows with SERFF HTTP 500 (after retry) or alpha "All nav failed". 0 = disabled.
+# Worker init sets this from --state-serff-streak-abort (default 3).
+_SERFF_STREAK_ABORT_THRESHOLD = 0
+
+# Force every row through the browser (auth + search-nav) instead of the
+# requests.Session HTTP path. Useful when SERFF returns 403 to `requests`
+# traffic but the same cookies still work in a real browser context.
+# Worker init sets this from --always-browser (default False).
+_ALWAYS_BROWSER = False
 
 
 class RowTimeout(Exception):
@@ -134,14 +149,28 @@ def _init_worker(
     with_zip=False,
     reauth_lock_timeout_sec=600,
     row_timeout_sec=0,
+    state_abort_window=0,
+    state_abort_min_success_pct=20.0,
+    state_max_wall_sec=0,
+    state_serff_streak_abort=0,
+    always_browser=False,
 ):
     """Pool initializer: store shared objects in each worker."""
     global _shared_counter, _failed_states, _preauth_cookies, _with_zip, _ROW_TIMEOUT_SEC
+    global _STATE_ABORT_WINDOW, _STATE_ABORT_MIN_SUCCESS_PCT, _STATE_MAX_WALL_SEC
+    global _SERFF_STREAK_ABORT_THRESHOLD, _ALWAYS_BROWSER
     _shared_counter = counter
     _failed_states = failed_states
     _preauth_cookies = preauth_cookies
     _with_zip = with_zip
     _ROW_TIMEOUT_SEC = int(row_timeout_sec) if row_timeout_sec else 0
+    _STATE_ABORT_WINDOW = int(state_abort_window) if state_abort_window else 0
+    _STATE_ABORT_MIN_SUCCESS_PCT = float(state_abort_min_success_pct)
+    _STATE_MAX_WALL_SEC = int(state_max_wall_sec) if state_max_wall_sec else 0
+    _SERFF_STREAK_ABORT_THRESHOLD = (
+        int(state_serff_streak_abort) if state_serff_streak_abort else 0
+    )
+    _ALWAYS_BROWSER = bool(always_browser)
     set_reauth_lock(reauth_lock)
     set_reauth_lock_timeout(reauth_lock_timeout_sec)
     set_headed_mode(headed)
@@ -223,8 +252,8 @@ def has_alpha_filing_id(url):
 
 
 # States to skip entirely (no work units created).
-SKIP_STATES = {"WA", "NM", "PA", "MI"}
-
+# SKIP_STATES = {"WA", "NM", "PA", "MI", "AL", "AZ", "DC", "OR", "MA", "MD"}
+SKIP_STATES = {"MA", "WA"}
 # Only these states continue to the next row on auth/re-auth failure (full run, skip rows only).
 # All other states are marked as failed and the whole state is skipped on first failure.
 STATES_CONTINUE_ON_FAILURE = {"ME"}
@@ -254,6 +283,45 @@ def build_work_units(df):
     return units
 
 
+def merge_work_units_by_state(units):
+    """
+    Merge multiple work units that share the same state (e.g. untried + failed-retry
+    queues) into one unit per state so no two workers ever scrape the same state in parallel.
+
+    Returns list of (work_label, state_name, df) sorted largest-first like build_work_units.
+    """
+    if not units:
+        return []
+    by_state = {}
+    order = []
+    for work_label, state_name, sdf in units:
+        if state_name not in by_state:
+            by_state[state_name] = []
+            order.append(state_name)
+        by_state[state_name].append(sdf)
+    merged = []
+    for sn in order:
+        parts = by_state[sn]
+        if len(parts) == 1:
+            combined = parts[0].copy()
+        else:
+            combined = pd.concat(parts, ignore_index=True)
+            if "SERFF Tracking Number" in combined.columns:
+                combined = combined.drop_duplicates(
+                    subset=["SERFF Tracking Number"], keep="first"
+                )
+        combined = combined.copy()
+        combined["_is_alpha"] = combined["page_url"].apply(has_alpha_filing_id)
+        combined = (
+            combined.sort_values("_is_alpha", kind="stable")
+            .drop(columns="_is_alpha")
+            .reset_index(drop=True)
+        )
+        merged.append((sn, sn, combined))
+    merged.sort(key=lambda x: len(x[2]), reverse=True)
+    return merged
+
+
 def _list_existing_output_files(output_dir):
     import glob
 
@@ -263,6 +331,23 @@ def _list_existing_output_files(output_dir):
         + glob.glob(os.path.join(output_dir, "backfilled_zip_*.csv"))
         + glob.glob(os.path.join(output_dir, "*backfilled*zip*.csv"))
     )
+
+
+def _read_csv_safely(path, **kwargs):
+    """
+    Read CSVs with stable parsing to avoid pandas mixed-type warnings.
+    Falls back to low_memory=False only if dtype mapping is incompatible
+    with a particular file schema.
+    """
+    dtype_map = {
+        "serf_num": "string",
+        "search_result_url": "string",
+        "SERFF Tracking Number": "string",
+    }
+    try:
+        return pd.read_csv(path, low_memory=False, dtype=dtype_map, **kwargs)
+    except (TypeError, ValueError):
+        return pd.read_csv(path, low_memory=False, **kwargs)
 
 
 def load_failed_zip_ids(output_dir="outputs"):
@@ -279,7 +364,7 @@ def load_failed_zip_ids(output_dir="outputs"):
 
     for f in existing_files:
         try:
-            tmp_df = pd.read_csv(f)
+            tmp_df = _read_csv_safely(f)
             if match_col not in tmp_df.columns or "zip_status" not in tmp_df.columns:
                 continue
 
@@ -309,7 +394,7 @@ _HEADER_ALIASES = {
 }
 
 # Base directory for ZIP downloads when running via Playwright
-ZIP_BASE_DIR = "/Users/favasm/Library/CloudStorage/GoogleDrive-favasm@greenberryai.com/Shared drives/MJ/scraping/downloads"
+ZIP_BASE_DIR = "/Users/favasm/Library/CloudStorage/GoogleDrive-favasm@greenberryai.com/Shared drives/MJ3/scraping/downloads"
 
 # SERFF ZIP: wait_for visible on #downloadLink, then expect_download after click (per attempt, ms).
 _ZIP_DOWNLOAD_LINK_WAIT_MS = (20_000, 30_000)
@@ -490,7 +575,7 @@ def parse_filing_metadata_html(html):
     return meta
 
 
-def _ensure_browser(pw, browser, context, page, state_name):
+def _ensure_browser(pw, browser, context, page, state_name, load_preauth_cookies=True):
     """
     Lazily launch a browser for alpha-ID search (headed or headless per global
     headed mode). If pre-authed cookies exist, loads them into the context.
@@ -503,15 +588,22 @@ def _ensure_browser(pw, browser, context, page, state_name):
     from browser_utils import _launch_browser, _new_stealth_context
 
     pw = sync_playwright().start()
-    # Use global headed mode (set in worker init) so laptop runs can be visible
-    browser = _launch_browser(pw, headed=None)
+    # Use global headed mode (set in worker init) so laptop runs can be visible.
+    # Pass state_name so SERFF_BROWSER_<STATE> env override (e.g.
+    # SERFF_BROWSER_CO=firefox) can pick a different engine for that state only.
+    browser = _launch_browser(pw, headed=None, state_name=state_name)
+    bt_name = getattr(browser.browser_type, "name", "browser")
     tprint(
-        f"[BROWSER] PID {os.getpid()} launching Firefox for alpha-ID search ({state_name})..."
+        f"[BROWSER] PID {os.getpid()} launching {bt_name} for alpha-ID search ({state_name})..."
     )
     context = _new_stealth_context(browser)
     page = context.new_page()
 
-    if _preauth_cookies is not None and state_name in _preauth_cookies:
+    if (
+        load_preauth_cookies
+        and _preauth_cookies is not None
+        and state_name in _preauth_cookies
+    ):
         context.add_cookies(_preauth_cookies[state_name])
         tprint(
             f"[BROWSER] PID {os.getpid()} loaded pre-authed cookies for {state_name}"
@@ -579,9 +671,14 @@ def download_and_process_zip(
     download_root, zip_file_path = _zip_output_paths(
         base_download_dir, state_name, tracking_number
     )
+    zip_abs = os.path.abspath(zip_file_path)
     os.makedirs(download_root, exist_ok=True)
 
     if _is_valid_zip_file(zip_file_path):
+        tprint(
+            f"[ZIP][SKIP] PID {os.getpid()} {state_name} {tracking_number}: "
+            f"existing {zip_abs}"
+        )
         return {
             "zip_status": "skipped_existing",
             "zip_size": int(os.path.getsize(zip_file_path)),
@@ -601,7 +698,7 @@ def download_and_process_zip(
         if naic_path and _is_valid_zip_file(zip_file_path):
             tprint(
                 f"[ZIP][NAIC] PID {os.getpid()} {state_name} {tracking_number}: "
-                f"saved {zip_file_path}"
+                f"saved {zip_abs}"
             )
             return {
                 "zip_status": "success",
@@ -615,7 +712,8 @@ def download_and_process_zip(
             else "naic download empty or invalid"
         )
         tprint(
-            f"[ZIP][NAIC] PID {os.getpid()} {state_name} {tracking_number}: {err_msg}"
+            f"[ZIP][NAIC] PID {os.getpid()} {state_name} {tracking_number}: {err_msg} "
+            f"(target {zip_abs})"
         )
         return {
             "zip_status": "failed",
@@ -660,6 +758,10 @@ def download_and_process_zip(
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         if _is_valid_zip_file(zip_file_path):
+            tprint(
+                f"[ZIP][SKIP] PID {os.getpid()} {state_name} {tracking_number}: "
+                f"existing {zip_abs}"
+            )
             return {
                 "zip_status": "skipped_existing",
                 "zip_size": int(os.path.getsize(zip_file_path)),
@@ -693,7 +795,7 @@ def download_and_process_zip(
             if _is_valid_zip_file(zip_file_path):
                 tprint(
                     f"[ZIP] PID {os.getpid()} {state_name} {tracking_number}: "
-                    f"saved {zip_file_path}"
+                    f"saved {zip_abs} ({int(os.path.getsize(zip_file_path))} bytes)"
                 )
                 return {
                     "zip_status": "success",
@@ -707,10 +809,43 @@ def download_and_process_zip(
         except Exception as e:
             last_error = str(e).splitlines()[0]
 
+        # Diagnostic: when a timeout fires, dump page state so we can tell
+        # "no attachments here" vs "redirected" vs "page never loaded" vs
+        # "link is rendered off-screen". Cheap and only runs on failure.
+        if last_error == "download timeout":
+            try:
+                cur_url = page.url
+            except Exception:
+                cur_url = "<unavailable>"
+            try:
+                cur_title = page.title()
+            except Exception:
+                cur_title = "<unavailable>"
+            try:
+                link_count = page.locator("[id='summaryForm:downloadLink']").count()
+            except Exception:
+                link_count = -1
+            try:
+                attachments_present = page.locator("#attachmentsContainer").count() > 0
+            except Exception:
+                attachments_present = False
+            missing_filing_id = (
+                isinstance(cur_url, str)
+                and "filingSummary.xhtml" in cur_url
+                and "filingId=" not in cur_url
+            )
+            tprint(
+                f"[ZIP][DIAG] PID {os.getpid()} {state_name} {tracking_number} "
+                f"attempt {attempt}: url={cur_url!r} title={cur_title!r} "
+                f"download_link_count={link_count} "
+                f"attachments_container={attachments_present} "
+                f"missing_filing_id={missing_filing_id}"
+            )
+
         tprint(
             f"[ZIP] PID {os.getpid()} {state_name} {tracking_number}: "
             f"attempt {attempt}/{max_attempts} failed: {last_error} "
-            f"(target {zip_file_path})"
+            f"(target {zip_abs})"
         )
         if attempt < max_attempts:
             # Controlled retry: refresh and retry with longer download wait.
@@ -721,6 +856,10 @@ def download_and_process_zip(
                 pass
             time.sleep(2.5 if attempt == 1 else 1.5)
 
+    tprint(
+        f"[ZIP] PID {os.getpid()} {state_name} {tracking_number}: "
+        f"failed after {max_attempts} attempts (target {zip_abs})"
+    )
     return {
         "zip_status": "failed",
         "zip_size": (
@@ -733,6 +872,72 @@ def download_and_process_zip(
     }
 
 
+def _row_meets_success_for_abort(df_state, idx):
+    """Row outcome for rolling-window state abort (aligned with load_already_processed)."""
+    if _with_zip:
+        z = df_state.at[idx, "zip_status"]
+        if pd.isna(z):
+            return False
+        zs = str(z).strip().lower()
+        return zs in ("success", "skipped_existing")
+    m = df_state.at[idx, "form_name_mapping"]
+    if m is None:
+        return False
+    if isinstance(m, float) and pd.isna(m):
+        return False
+    if isinstance(m, str) and not str(m).strip():
+        return False
+    return True
+
+
+def _execute_state_abort(df_state, processed_indices, state_name, work_label, reason):
+    """Mark untouched rows, log, set shared failed flag; returns True so caller breaks the row loop."""
+    col = "state_aborted_reason"
+    if col not in df_state.columns:
+        df_state[col] = pd.NA
+    for i in df_state.index:
+        if i not in processed_indices:
+            df_state.at[i, col] = reason
+    tprint(
+        f"[STATE_ABORT] PID {os.getpid()} {work_label}: {state_name} — {reason} "
+        f"(partial CSV; {len(processed_indices)} rows completed this run)"
+    )
+    if _failed_states is not None:
+        _failed_states[state_name] = True
+    return True
+
+
+_StatePassResult = namedtuple(
+    "_StatePassResult",
+    "kind path",
+    defaults=(None,),
+)
+
+
+def _stop_playwright_safe(pw, browser):
+    """Close browser and stop Playwright; safe if either is None."""
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
+def _write_state_results_csv(work_label, df_state):
+    safe_label = "".join(
+        c if c.isalnum() or c in (" ", "-", "_") else "_" for c in work_label
+    )
+    result_file = f"outputs/state_results_{safe_label}_{os.getpid()}.csv"
+    df_state.to_csv(result_file, index=False)
+    tprint(f"  ✓ Saved: {os.path.abspath(result_file)} ({len(df_state)} rows)")
+    return result_file
+
+
 def process_state(state_data):
     """
     Process all rows for one state.
@@ -743,6 +948,10 @@ def process_state(state_data):
     filing ID requires search navigation (6% of rows).
 
     Without pre-auth, falls back to the original browser-first flow.
+
+    On hard initial auth or hard re-auth failure (non-ME), runs up to two
+    full passes: pass 2 uses a fresh browser login (batch pre-auth cookies
+    are ignored on that pass).
     """
     work_label, state_name, df_state = state_data
 
@@ -768,13 +977,68 @@ def process_state(state_data):
     # Stagger worker startups
     time.sleep(random.uniform(1, 6))
 
+    had_preauth = _preauth_cookies is not None and state_name in _preauth_cookies
+    first_pass_row_indices = set()
+
+    for attempt in range(2):
+        force_full_browser_auth = attempt == 1 and had_preauth
+        if attempt == 1:
+            tprint(
+                f"[STATE_RETRY] PID {os.getpid()} {work_label}: pass 2/2 — "
+                f"fresh browser login (ignoring batch pre-auth cookies)"
+            )
+        out = _process_state_single_pass(
+            work_label,
+            state_name,
+            df_state,
+            force_full_browser_auth=force_full_browser_auth,
+            attempt=attempt,
+            first_pass_row_indices=first_pass_row_indices,
+        )
+        if out.kind == "me_auth_fail":
+            return None
+        if out.kind in ("completed", "state_aborted"):
+            return out.path
+        if out.kind == "hard_auth":
+            if attempt == 1:
+                tprint(
+                    f"[SKIP_STATE] PID {os.getpid()} {work_label}: auth/re-auth failed "
+                    f"on 2 passes — marking {state_name} failed, saving CSV"
+                )
+                if _failed_states is not None:
+                    _failed_states[state_name] = True
+                return _write_state_results_csv(work_label, df_state)
+            tprint(
+                f"[STATE_RETRY] PID {os.getpid()} {work_label}: pass 1 auth/re-auth "
+                f"failed — retrying entire state on pass 2"
+            )
+            continue
+
+    return None
+
+
+def _process_state_single_pass(
+    work_label,
+    state_name,
+    df_state,
+    *,
+    force_full_browser_auth,
+    attempt,
+    first_pass_row_indices,
+):
+    """One browser lifecycle: bootstrap, all rows, save CSV (or hard_auth / me_auth_fail)."""
+    has_preauth_effective = (
+        not force_full_browser_auth
+        and _preauth_cookies is not None
+        and state_name in _preauth_cookies
+    )
+    use_preauth_in_browser = has_preauth_effective
+
     # --- Bootstrap HTTP session -----------------------------------------------
     pw = browser = context = page = None
     http_session = None
 
-    has_preauth = _preauth_cookies is not None and state_name in _preauth_cookies
-
-    if has_preauth:
+    if has_preauth_effective:
         http_session = create_http_session_from_cookies(_preauth_cookies[state_name])
         tprint(f"[WORKER] PID {os.getpid()} using pre-authed cookies for {state_name}")
     else:
@@ -786,16 +1050,21 @@ def process_state(state_data):
             )
         if not auth_ok:
             tprint(f"[ERROR] Auth failed for {work_label}")
-            if (
-                state_name not in STATES_CONTINUE_ON_FAILURE
-                and _failed_states is not None
-            ):
-                _failed_states[state_name] = True
-            return None
+            if state_name in STATES_CONTINUE_ON_FAILURE:
+                _stop_playwright_safe(pw, browser)
+                return _StatePassResult("me_auth_fail", None)
+            _stop_playwright_safe(pw, browser)
+            return _StatePassResult("hard_auth", None)
         http_session = create_http_session(context)
 
     # --- Process rows ---------------------------------------------------------
+    state_row_loop_aborted = False
     rows_since_keepalive = 0
+    abort_window = _STATE_ABORT_WINDOW
+    state_start = time.monotonic()
+    processed_indices = set()
+    outcomes = deque(maxlen=abort_window) if abort_window > 0 else None
+    serff_fail_streak = 0
 
     try:
         for row in tqdm(
@@ -806,8 +1075,12 @@ def process_state(state_data):
             idx = row.Index
             url = row.page_url
 
+            row_aborted_state = False
+            serff_streak_row_bump = False
+            path1_hard_http_500 = False
             _row_timer_arm()
             try:
+                skip_heavy_delay = False
                 # Use an explicit column lookup for stable folder naming.
                 # Positional tuple fields (e.g. "_1") can shift when column order changes.
                 tracking_number = None
@@ -825,11 +1098,28 @@ def process_state(state_data):
 
                 if not pd.isna(tracking_number):
                     tracking_number = str(tracking_number).strip()
+                # Pass 2 (or any rerun) reuses df_state: skip HTTP/scrape if ZIP already done
+                # this run and the zip file is still on disk.
+                if _with_zip:
+                    zn = df_state.at[idx, "zip_status"]
+                    if pd.notna(zn):
+                        znl = str(zn).strip().lower()
+                        if znl in ("success", "skipped_existing"):
+                            if tracking_number:
+                                _, zp = _zip_output_paths(
+                                    ZIP_BASE_DIR, state_name, tracking_number
+                                )
+                                if _is_valid_zip_file(zp):
+                                    skip_heavy_delay = True
+                                    continue
+
                 is_alpha = has_alpha_filing_id(url)
                 html = None
 
                 # ---- Path 1: Direct URL via requests (no browser) ----
-                if not is_alpha:
+                # Skipped entirely when --always-browser is set, so every row
+                # goes through the authenticated browser + search-nav flow.
+                if not is_alpha and not _ALWAYS_BROWSER:
                     page_html, expired, srv_err = fetch_page(http_session, url)
 
                     if srv_err:
@@ -838,13 +1128,20 @@ def process_state(state_data):
                         )
                         time.sleep(random.uniform(15, 30))
                         page_html, expired, srv_err = fetch_page(http_session, url)
+                    if srv_err:
+                        path1_hard_http_500 = True
 
                     if expired and not srv_err:
                         tprint(
                             f"[HTTP] PID {os.getpid()} row {idx}: Session expired, re-authenticating..."
                         )
                         pw, browser, context, page = _ensure_browser(
-                            pw, browser, context, page, state_name
+                            pw,
+                            browser,
+                            context,
+                            page,
+                            state_name,
+                            use_preauth_in_browser,
                         )
                         context, page, http_session, auth_ok = _reauth_and_refresh(
                             browser, context, page, state_name, http_session
@@ -855,12 +1152,8 @@ def process_state(state_data):
                             tprint(
                                 f"[ERROR] PID {os.getpid()} Re-auth failed for {state_name}"
                             )
-                            if (
-                                state_name not in STATES_CONTINUE_ON_FAILURE
-                                and _failed_states is not None
-                            ):
-                                _failed_states[state_name] = True
-                                return None
+                            if state_name not in STATES_CONTINUE_ON_FAILURE:
+                                return _StatePassResult("hard_auth", None)
                             continue
 
                     if page_html and not expired and not srv_err:
@@ -882,7 +1175,12 @@ def process_state(state_data):
                                     "[HTTP] Human Verification detected — opening headed browser; please complete verification in the visible window."
                                 )
                             pw, browser, context, page = _ensure_browser(
-                                pw, browser, context, page, state_name
+                                pw,
+                                browser,
+                                context,
+                                page,
+                                state_name,
+                                use_preauth_in_browser,
                             )
                             if is_human_verification:
                                 cookies = headed_reauth(state_name)
@@ -915,13 +1213,12 @@ def process_state(state_data):
                                 tprint(
                                     f"[ERROR] PID {os.getpid()} Re-auth failed for {state_name}"
                                 )
-                                if (
-                                    state_name not in STATES_CONTINUE_ON_FAILURE
-                                    and _failed_states is not None
-                                ):
-                                    _failed_states[state_name] = True
-                                    return None
+                                if state_name not in STATES_CONTINUE_ON_FAILURE:
+                                    return _StatePassResult("hard_auth", None)
                                 continue
+
+                    if html is None and not is_alpha and path1_hard_http_500:
+                        serff_streak_row_bump = True
 
                 # ---- Path 2: Alpha IDs or failed direct fetch -> Playwright search ----
                 if html is None:
@@ -934,9 +1231,10 @@ def process_state(state_data):
                         continue
 
                     pw, browser, context, page = _ensure_browser(
-                        pw, browser, context, page, state_name
+                        pw, browser, context, page, state_name, use_preauth_in_browser
                     )
 
+                    nav_reason = None
                     for search_attempt in range(3):
                         if search_attempt > 0:
                             wait = 15 * search_attempt
@@ -951,17 +1249,18 @@ def process_state(state_data):
                                 tprint(
                                     f"[ERROR] PID {os.getpid()} Re-auth failed for {state_name}"
                                 )
-                                if (
-                                    state_name not in STATES_CONTINUE_ON_FAILURE
-                                    and _failed_states is not None
-                                ):
-                                    _failed_states[state_name] = True
-                                    return None
+                                if state_name not in STATES_CONTINUE_ON_FAILURE:
+                                    return _StatePassResult("hard_auth", None)
                                 break  # skip this row, fall through to "if html is None" then continue
 
-                        if navigate_via_search(
-                            page, context, tracking_number, state_name
-                        ):
+                        nav_ok, nav_reason = navigate_via_search(
+                            page,
+                            context,
+                            tracking_number,
+                            state_name,
+                            return_reason=True,
+                        )
+                        if nav_ok:
                             if not is_server_error(page):
                                 df_state.at[idx, "search_result_url"] = page.url
                                 html = page.content()
@@ -970,7 +1269,21 @@ def process_state(state_data):
                                 f"[500] PID {os.getpid()} row {idx}: 500 after search for {tracking_number}"
                             )
                             time.sleep(random.uniform(15, 30))
-                        elif is_server_error(page):
+                            continue
+
+                        # "no_results" is deterministic: search succeeded but the
+                        # filing is not in this state's SERFF instance. Re-auth +
+                        # retry will return the same empty table, so bail fast
+                        # (saves ~3 min/row vs. the full 3-attempt loop).
+                        if nav_reason == "no_results":
+                            tprint(
+                                f"[SKIP] PID {os.getpid()} row {idx}: "
+                                f"search returned 0 results for {tracking_number} "
+                                f"(filing not in {state_name} SERFF) — skipping retries"
+                            )
+                            break
+
+                        if is_server_error(page):
                             tprint(
                                 f"[500] PID {os.getpid()} row {idx}: 500 during search for {tracking_number}"
                             )
@@ -978,8 +1291,15 @@ def process_state(state_data):
 
                     if html is None:
                         tprint(
-                            f"[SKIP] PID {os.getpid()} row {idx}: All nav failed for {tracking_number}"
+                            f"[SKIP] PID {os.getpid()} row {idx}: "
+                            f"All nav failed for {tracking_number} "
+                            f"(last_reason={nav_reason})"
                         )
+                        # Don't penalise the state-streak abort for deterministic
+                        # "this filing doesn't exist here" — only true transient
+                        # failures should count toward the abort threshold.
+                        if nav_reason != "no_results":
+                            serff_streak_row_bump = True
                         continue
 
                 # ---- Parse with BeautifulSoup ----
@@ -1003,7 +1323,12 @@ def process_state(state_data):
                             f"[RETRY] PID {os.getpid()} row {idx}: No match, re-auth and re-fetch once..."
                         )
                         pw, browser, context, page = _ensure_browser(
-                            pw, browser, context, page, state_name
+                            pw,
+                            browser,
+                            context,
+                            page,
+                            state_name,
+                            use_preauth_in_browser,
                         )
                         context, page, http_session, _ = _reauth_and_refresh(
                             browser, context, page, state_name, http_session
@@ -1065,6 +1390,7 @@ def process_state(state_data):
                 # ---- Optional ZIP download (no parsing, just save ZIP) ----
                 if _with_zip:
                     try:
+                        zip_abs = None
                         if not tracking_number or (
                             isinstance(tracking_number, float)
                             and pd.isna(tracking_number)
@@ -1078,7 +1404,12 @@ def process_state(state_data):
                         _, zip_file_path = _zip_output_paths(
                             ZIP_BASE_DIR, state_name, tracking_number
                         )
+                        zip_abs = os.path.abspath(zip_file_path)
                         if _is_valid_zip_file(zip_file_path):
+                            tprint(
+                                f"[ZIP][SKIP] PID {os.getpid()} row {idx} "
+                                f"{tracking_number}: existing {zip_abs}"
+                            )
                             df_state.at[idx, "zip_status"] = "skipped_existing"
                             df_state.at[idx, "zip_size"] = int(
                                 os.path.getsize(zip_file_path)
@@ -1088,14 +1419,62 @@ def process_state(state_data):
                             continue
 
                         pw, browser, context, page = _ensure_browser(
-                            pw, browser, context, page, state_name
+                            pw,
+                            browser,
+                            context,
+                            page,
+                            state_name,
+                            use_preauth_in_browser,
+                        )
+                        # For alpha-ID rows, the original `url` is the bare
+                        # filingSummary.xhtml (no ?filingId=...) — re-goto'ing
+                        # to it makes SERFF return 403. Use the URL resolved
+                        # by navigate_via_search() instead. Also skip the goto
+                        # entirely if the page is already on the right filing
+                        # summary.
+                        resolved_url = url
+                        if "search_result_url" in df_state.columns:
+                            sru = df_state.at[idx, "search_result_url"]
+                            if isinstance(sru, str) and sru.strip():
+                                resolved_url = sru.strip()
+                        try:
+                            cur_page_url = page.url
+                        except Exception:
+                            cur_page_url = ""
+                        already_on_target = (
+                            isinstance(cur_page_url, str)
+                            and "filingSummary.xhtml" in cur_page_url
+                            and "filingId=" in cur_page_url
+                            and (
+                                resolved_url == cur_page_url
+                                or (
+                                    "filingId=" in resolved_url
+                                    and cur_page_url.split("filingId=", 1)[1].split(
+                                        "&"
+                                    )[0]
+                                    == resolved_url.split("filingId=", 1)[1].split("&")[
+                                        0
+                                    ]
+                                )
+                            )
                         )
                         try:
-                            page.goto(url, wait_until="networkidle", timeout=60_000)
+                            if already_on_target:
+                                tprint(
+                                    f"[ZIP] PID {os.getpid()} row {idx} {tracking_number}: "
+                                    f"reusing in-place filing summary (no re-goto)"
+                                )
+                            else:
+                                page.goto(
+                                    resolved_url,
+                                    wait_until="networkidle",
+                                    timeout=60_000,
+                                )
                         except Exception as e:
                             tprint(
                                 f"[ZIP] PID {os.getpid()} row {idx} {tracking_number}: "
-                                f"goto failed: {str(e).splitlines()[0]}"
+                                f"goto failed: {str(e).splitlines()[0]} "
+                                f"(target {zip_abs})"
                             )
                             df_state.at[idx, "zip_status"] = "failed"
                             df_state.at[idx, "zip_size"] = (
@@ -1129,9 +1508,10 @@ def process_state(state_data):
                                 "zip_error", pd.NA
                             )
                     except Exception as e:
+                        _zp = f" (target {zip_abs})" if zip_abs is not None else ""
                         tprint(
                             f"[ZIP] PID {os.getpid()} row {idx} {tracking_number}: "
-                            f"unexpected error: {str(e).splitlines()[0]}"
+                            f"unexpected error: {str(e).splitlines()[0]}{_zp}"
                         )
                         df_state.at[idx, "zip_status"] = "failed"
                         df_state.at[idx, "zip_size"] = pd.NA
@@ -1148,8 +1528,10 @@ def process_state(state_data):
                         )
 
             except RowTimeout:
+                serff_fail_streak = 0
                 _apply_row_timeout_skip(df_state, idx, row, url)
             except Exception as e:
+                serff_fail_streak = 0
                 serf = getattr(row, "serf_num", "unknown")
                 tprint(
                     f"[ERROR] PID {os.getpid()} row {idx} (serf_num={serf}): {str(e).splitlines()[0]}"
@@ -1166,60 +1548,110 @@ def process_state(state_data):
                 _row_timer_disarm()
                 if _shared_counter is not None:
                     with _shared_counter.get_lock():
-                        _shared_counter.value += 1
+                        if attempt == 0:
+                            first_pass_row_indices.add(idx)
+                            _shared_counter.value += 1
+                        elif idx not in first_pass_row_indices:
+                            _shared_counter.value += 1
 
-                rows_since_keepalive += 1
+                processed_indices.add(idx)
 
-                if rows_since_keepalive >= KEEPALIVE_EVERY:
-                    keepalive_session(http_session)
-                    rows_since_keepalive = 0
-
-                delay = random.uniform(MIN_DELAY_BETWEEN_ROWS, MAX_DELAY_BETWEEN_ROWS)
-                time.sleep(delay)
-
-                if idx > 0 and idx % LONG_PAUSE_EVERY == 0:
-                    pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
-                    tprint(
-                        f"[THROTTLE] PID {os.getpid()} taking {pause:.0f}s breather after {idx} rows..."
+                if outcomes is not None and abort_window > 0:
+                    outcomes.append(
+                        1 if _row_meets_success_for_abort(df_state, idx) else 0
                     )
-                    time.sleep(pause)
+                    if len(outcomes) == abort_window:
+                        ok_pct = 100.0 * sum(outcomes) / abort_window
+                        if ok_pct < _STATE_ABORT_MIN_SUCCESS_PCT:
+                            row_aborted_state = _execute_state_abort(
+                                df_state,
+                                processed_indices,
+                                state_name,
+                                work_label,
+                                f"rolling_window (last {abort_window} rows "
+                                f"success_rate={ok_pct:.1f}% "
+                                f"< threshold {_STATE_ABORT_MIN_SUCCESS_PCT}%)",
+                            )
+                if (
+                    not row_aborted_state
+                    and _STATE_MAX_WALL_SEC > 0
+                    and (time.monotonic() - state_start) >= _STATE_MAX_WALL_SEC
+                ):
+                    row_aborted_state = _execute_state_abort(
+                        df_state,
+                        processed_indices,
+                        state_name,
+                        work_label,
+                        f"wall_clock ({(time.monotonic() - state_start):.0f}s "
+                        f">= {_STATE_MAX_WALL_SEC}s)",
+                    )
+
+                if not row_aborted_state and _SERFF_STREAK_ABORT_THRESHOLD > 0:
+                    if _row_meets_success_for_abort(df_state, idx):
+                        serff_fail_streak = 0
+                    elif serff_streak_row_bump:
+                        serff_fail_streak += 1
+                        if serff_fail_streak >= _SERFF_STREAK_ABORT_THRESHOLD:
+                            row_aborted_state = _execute_state_abort(
+                                df_state,
+                                processed_indices,
+                                state_name,
+                                work_label,
+                                f"consecutive_serff_500_or_nav_failures "
+                                f"({serff_fail_streak} >= {_SERFF_STREAK_ABORT_THRESHOLD})",
+                            )
+
+                if not row_aborted_state:
+                    if not skip_heavy_delay:
+                        rows_since_keepalive += 1
+
+                        if rows_since_keepalive >= KEEPALIVE_EVERY:
+                            keepalive_session(http_session)
+                            rows_since_keepalive = 0
+
+                        delay = random.uniform(
+                            MIN_DELAY_BETWEEN_ROWS, MAX_DELAY_BETWEEN_ROWS
+                        )
+                        time.sleep(delay)
+
+                        if idx > 0 and idx % LONG_PAUSE_EVERY == 0:
+                            pause = random.uniform(LONG_PAUSE_MIN, LONG_PAUSE_MAX)
+                            tprint(
+                                f"[THROTTLE] PID {os.getpid()} taking {pause:.0f}s breather after {idx} rows..."
+                            )
+                            time.sleep(pause)
+
+            if row_aborted_state:
+                state_row_loop_aborted = True
+                break
 
             if idx % 10 == 0 and idx > 0:
                 checkpoint_file = f"outputs/temp_results_{work_label}_{os.getpid()}.csv"
                 if _with_zip:
-                    is_zip_success = (
-                        df_state["zip_status"].astype(str).str.lower() == "success"
-                    )
-                    df_state.loc[is_zip_success].to_csv(checkpoint_file, index=False)
+                    zs = df_state["zip_status"].astype(str).str.lower()
+                    chk_df = df_state.loc[zs.isin(["success", "skipped_existing"])]
                 else:
                     with_mapping = df_state["form_name_mapping"].notna()
-                    df_state.loc[with_mapping].to_csv(checkpoint_file, index=False)
+                    chk_df = df_state.loc[with_mapping]
+                chk_df.to_csv(checkpoint_file, index=False)
+                tprint(
+                    f"[CHECKPOINT] {work_label} PID {os.getpid()}: "
+                    f"{os.path.abspath(checkpoint_file)} ({len(chk_df)} rows)"
+                )
     finally:
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        if pw is not None:
-            try:
-                pw.stop()
-            except Exception:
-                pass
+        _stop_playwright_safe(pw, browser)
 
-    safe_label = "".join(
-        c if c.isalnum() or c in (" ", "-", "_") else "_" for c in work_label
-    )
-    result_file = f"outputs/state_results_{safe_label}_{os.getpid()}.csv"
-    df_state.to_csv(result_file, index=False)
-    tprint(f"  ✓ Saved: {result_file} ({len(df_state)} rows)")
-    return result_file
+    path = _write_state_results_csv(work_label, df_state)
+    if state_row_loop_aborted:
+        return _StatePassResult("state_aborted", path)
+    return _StatePassResult("completed", path)
 
 
 def load_already_processed(output_dir="outputs", with_zip=False):
     """
     Scan existing result CSVs and return a set of SERFF Tracking Numbers
     that have already been fully processed.
-    In ZIP mode, "done" means zip_status == success.
+    In ZIP mode, "done" means zip_status is success or skipped_existing (ZIP already on disk).
     In non-ZIP mode, "done" means non-null form_name_mapping.
     Also returns a list of the DataFrames so they can be included in the final merge.
     """
@@ -1238,7 +1670,7 @@ def load_already_processed(output_dir="outputs", with_zip=False):
 
     for f in existing_files:
         try:
-            tmp_df = pd.read_csv(f)
+            tmp_df = _read_csv_safely(f)
             if MATCH_COL not in tmp_df.columns:
                 continue
 
@@ -1247,7 +1679,8 @@ def load_already_processed(output_dir="outputs", with_zip=False):
             if with_zip:
                 if "zip_status" not in tmp_df.columns:
                     continue
-                has_data = tmp_df["zip_status"].astype(str).str.lower() == "success"
+                zs = tmp_df["zip_status"].astype(str).str.lower()
+                has_data = zs.isin(["success", "skipped_existing"])
             else:
                 if "form_name_mapping" not in tmp_df.columns:
                     continue
@@ -1306,21 +1739,79 @@ def parse_args():
         help="Max wall-clock seconds per row on Unix/macOS via SIGALRM (default: 1800); "
         "0=disabled. On timeout the row is skipped (zip_status=skipped_timeout when --with-zip).",
     )
+    parser.add_argument(
+        "--preauth-all-states",
+        action="store_true",
+        help="Before workers start, serially pre-authenticate every state (headed CAPTCHA UX). "
+        "Default is lazy per-worker auth (empty batch pre-auth) for the global state queue.",
+    )
+    parser.add_argument(
+        "--state-abort-window",
+        type=int,
+        default=40,
+        help="Rolling row window for state-level abort: if the last N rows' success rate "
+        "(ZIP success/skipped_existing with --with-zip, else form_name_mapping) falls below "
+        "--state-abort-min-success-pct, save partial CSV and stop this state. 0=disabled.",
+    )
+    parser.add_argument(
+        "--state-abort-min-success-pct",
+        type=float,
+        default=20.0,
+        help="Min success %% within the rolling window before state abort (default: 20).",
+    )
+    parser.add_argument(
+        "--state-max-wall-sec",
+        type=int,
+        default=0,
+        help="Max wall-clock seconds for one state worker; 0=disabled. Saves partial CSV on expiry.",
+    )
+    parser.add_argument(
+        "--state-serff-streak-abort",
+        type=int,
+        default=3,
+        help="Abort this state after N consecutive rows where SERFF still returns HTTP 500 "
+        "(after one retry fetch) on direct URLs, or alpha search ends in 'All nav failed'. "
+        "Resets when a row meets the same success criteria as --state-abort-window. "
+        "Default: 3 (enabled). Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--always-browser",
+        action="store_true",
+        default=False,
+        help="Skip the requests.Session HTTP fetch path and route EVERY row "
+        "through the authenticated browser (auth + search-nav). Slower per "
+        "row, but works around SERFF 403s on plain HTTP traffic.",
+    )
     parser.set_defaults(headless=False)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
+    # Prefer Chromium for this script unless SERFF_BROWSER is already set.
+    os.environ.setdefault("SERFF_BROWSER", "chromium")
     args = parse_args()
     n_proc = args.workers
     headed = not args.headless
     tprint(
         f"[CONFIG] reauth_lock_timeout_sec={args.reauth_lock_timeout_sec} "
         f"(0=wait forever), row_timeout_sec={args.row_timeout_sec} "
-        f"(0=off; Unix/macOS skips row on expiry)"
+        f"(0=off; Unix/macOS skips row on expiry); "
+        f"state_abort_window={args.state_abort_window} "
+        f"(0=off), state_abort_min_success_pct={args.state_abort_min_success_pct}, "
+        f"state_max_wall_sec={args.state_max_wall_sec} (0=off), "
+        f"state_serff_streak_abort={args.state_serff_streak_abort} (0=off), "
+        f"preauth_all_states={args.preauth_all_states}, "
+        f"always_browser={args.always_browser}"
+    )
+    tprint(f"[OUTPUT] CSV outputs dir: {os.path.abspath('outputs')}")
+    if args.with_zip:
+        tprint(f"[OUTPUT] ZIP downloads dir: {os.path.abspath(ZIP_BASE_DIR)}")
+    tprint(
+        f"[OUTPUT] Final merge file (on completion): "
+        f"{os.path.abspath('form_names_mapping.csv')}"
     )
 
-    form_df = pd.read_csv("data/form_data.csv")
+    form_df = _read_csv_safely("data/form_data.csv")
     df = form_df.copy()
     df["SERFF Tracking Number"] = df["SERFF Tracking Number"].astype(str)
 
@@ -1349,8 +1840,9 @@ if __name__ == "__main__":
     if len(df) == 0:
         tprint("[RESUME] All rows already processed! Combining previous results...")
         final_df = pd.concat(prev_result_dfs, ignore_index=True)
+        final_path = os.path.abspath("form_names_mapping.csv")
         final_df.to_csv("form_names_mapping.csv", index=False)
-        tprint(f"\nResults saved to form_names_mapping.csv ({len(final_df)} rows)")
+        tprint(f"\nResults saved to {final_path} ({len(final_df)} rows)")
         exit(0)
 
     failed_retry_ids = load_failed_zip_ids("outputs") if args.with_zip else set()
@@ -1375,11 +1867,14 @@ if __name__ == "__main__":
         build_work_units(df_failed_retry) if len(df_failed_retry) else []
     )
     work_units = work_units_untried + work_units_failed
-    total_batches = (len(work_units) + n_proc - 1) // n_proc
+    merged_units = merge_work_units_by_state(work_units)
 
     if SKIP_STATES:
         tprint(f"[SKIP] Skipping states: {', '.join(sorted(SKIP_STATES))}")
-    tprint(f"\n{len(work_units)} states, {n_proc} workers, {total_batches} batches")
+    tprint(
+        f"\n{len(work_units)} raw work units -> {len(merged_units)} states after merge, "
+        f"{n_proc} workers (continuous queue)"
+    )
     tprint(
         f"Total URLs to process: {len(df)} (skipped {original_len - len(df)} already done)"
     )
@@ -1387,7 +1882,7 @@ if __name__ == "__main__":
         tprint(
             f"[ORDER] Untried first: {len(df_untried)} rows, failed retries last: {len(df_failed_retry)} rows"
         )
-    for rank, (w_label, _s, w_df) in enumerate(work_units, 1):
+    for rank, (w_label, _s, w_df) in enumerate(merged_units, 1):
         tprint(f"  {rank}. {w_label}: {len(w_df)} URLs")
     tprint("=" * 70)
 
@@ -1408,43 +1903,51 @@ if __name__ == "__main__":
     all_result_files = []
 
     # ------------------------------------------------------------------
-    # Process states in batches — auth only the batch about to run
-    # so cookies stay fresh.
+    # One pool over all states (queue): when a worker finishes, it picks the next state.
+    # Optional serial pre-auth for all states; default is lazy auth per worker/state.
     # ------------------------------------------------------------------
-    for batch_start in range(0, len(work_units), n_proc):
-        batch = work_units[batch_start : batch_start + n_proc]
-        batch_num = batch_start // n_proc + 1
-        batch_states = [state_name for _label, state_name, _df in batch]
-
-        tprint(f"\n{'='*70}")
-        tprint(f"Batch {batch_num}/{total_batches}: {', '.join(batch_states)}")
-        tprint(f"{'='*70}")
-
-        preauth_cookies = pre_authenticate_all_states(batch_states, headed=headed)
-
-        for s in batch_states:
+    unique_states = [s for _l, s, _df in merged_units]
+    if args.preauth_all_states and unique_states:
+        tprint(
+            f"\n{'='*70}\n[PRE-AUTH] All {len(unique_states)} states (serial)\n{'='*70}"
+        )
+        preauth_cookies = pre_authenticate_all_states(unique_states, headed=headed)
+        for s in unique_states:
             if s not in preauth_cookies and s not in STATES_CONTINUE_ON_FAILURE:
                 failed_states[s] = True
+    else:
+        preauth_cookies = {}
 
-        actual_procs = min(n_proc, len(batch))
+    if not merged_units:
+        tprint("[ERROR] No work units after merge")
+        exit(1)
 
-        with Pool(
-            actual_procs,
-            initializer=_init_worker,
-            initargs=(
-                total_counter,
-                failed_states,
-                reauth_lock,
-                dict(preauth_cookies),
-                headed,
-                args.with_zip,
-                args.reauth_lock_timeout_sec,
-                args.row_timeout_sec,
-            ),
-        ) as pool:
-            results = list(pool.imap_unordered(process_state, batch))
+    actual_procs = min(n_proc, len(merged_units))
 
-        all_result_files.extend(results)
+    tprint(
+        f"\n{'='*70}\n[POOL] Starting {actual_procs} workers over {len(merged_units)} states\n{'='*70}"
+    )
+
+    with Pool(
+        actual_procs,
+        initializer=_init_worker,
+        initargs=(
+            total_counter,
+            failed_states,
+            reauth_lock,
+            dict(preauth_cookies),
+            headed,
+            args.with_zip,
+            args.reauth_lock_timeout_sec,
+            args.row_timeout_sec,
+            args.state_abort_window,
+            args.state_abort_min_success_pct,
+            args.state_max_wall_sec,
+            args.state_serff_streak_abort,
+            args.always_browser,
+        ),
+    ) as pool:
+        all_result_files.extend(pool.imap_unordered(process_state, merged_units))
 
     stop_event.set()
     monitor.join()
@@ -1457,7 +1960,7 @@ if __name__ == "__main__":
 
     for f in all_result_files:
         if f is not None and os.path.exists(f):
-            all_dfs.append(pd.read_csv(f))
+            all_dfs.append(_read_csv_safely(f))
             all_state_csvs.append(f)
 
     if not all_dfs:
@@ -1492,9 +1995,10 @@ if __name__ == "__main__":
     for col in ["_has_mapping", "_has_zip"]:
         if col in final_df.columns:
             final_df = final_df.drop(columns=[col])
+    final_path = os.path.abspath("form_names_mapping.csv")
     final_df.to_csv("form_names_mapping.csv", index=False)
 
     tprint(
-        f"\nAll done. Results saved to form_names_mapping.csv ({len(final_df)} rows)"
+        f"\nAll done. Results saved to {final_path} ({len(final_df)} rows)"
         f"\n  ({len(prev_result_dfs)} previously processed files + {len(all_state_csvs)} new state results merged)"
     )

@@ -37,8 +37,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 BACKOFF_ON_500 = [15, 30, 60]  # seconds to wait on successive 500 errors
 
 # Firefox user-agent strings — must match the actual browser engine to avoid
-# TLS/UA mismatch detection (Firefox TLS fingerprint != Chrome TLS fingerprint)
-_USER_AGENTS = [
+# TLS/UA mismatch detection.
+_FIREFOX_USER_AGENTS = [
     # Firefox 133 – macOS Sonoma
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:133.0) Gecko/20100101 Firefox/133.0",
     # Firefox 132 – macOS Sonoma
@@ -61,6 +61,31 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
 ]
 
+# Safari/WebKit-aligned user-agent strings.
+_WEBKIT_USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+]
+
+# Chrome user-agent strings — used when the launched engine is Chromium.
+# These MUST be Chrome UAs (not Firefox) or anti-bot WAFs flag the
+# UA/TLS/Client-Hints mismatch and return 403 (observed on SERFF).
+_CHROME_USER_AGENTS = [
+    # Chrome 134 – macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    # Chrome 133 – macOS Sonoma
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    # Chrome 132 – macOS Ventura
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    # Chrome 134 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    # Chrome 133 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    # Chrome 132 – Windows 10
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+]
+
 # Viewport sizes that look like real monitors
 _VIEWPORTS = [
     {"width": 1920, "height": 1080},
@@ -72,32 +97,15 @@ _VIEWPORTS = [
     {"width": 2560, "height": 1440},
 ]
 
-# Stealth JS tailored for Firefox — no Chrome-specific objects
-_STEALTH_SCRIPT = """
+# Stealth JS that avoids engine-specific spoofing.
+_STEALTH_SCRIPT_COMMON = """
     // Hide webdriver flag (primary automation indicator)
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
     try { delete navigator.__proto__.webdriver; } catch(e) {}
 
-    // Firefox-realistic plugin list (PDF viewer only)
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => {
-            const plugins = [
-                {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
-                {name: 'Firefox PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
-            ];
-            plugins.length = 2;
-            return plugins;
-        }
-    });
-
     // Languages
     Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
     Object.defineProperty(navigator, 'language', {get: () => 'en-US'});
-
-    // Platform
-    Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
-
-    // Firefox does NOT have window.chrome — don't add it (that would be a red flag)
 
     Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
 
@@ -129,6 +137,20 @@ _STEALTH_SCRIPT = """
         }
         return origToDataURL.apply(this, arguments);
     };
+"""
+
+# Firefox-only additions (keep browser fingerprints internally consistent).
+_STEALTH_SCRIPT_FIREFOX = """
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+            const plugins = [
+                {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+                {name: 'Firefox PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+            ];
+            plugins.length = 2;
+            return plugins;
+        }
+    });
 """
 
 # Optional proxy — set env var SCRAPER_PROXY to use (e.g. "http://user:pass@host:port")
@@ -171,9 +193,20 @@ def set_headed_mode(headed):
 # ---------------------------------------------------------------------------
 
 
-def _pick_identity():
-    """Pick a random user-agent + viewport combo for a new context."""
-    return random.choice(_USER_AGENTS), random.choice(_VIEWPORTS)
+def _pick_identity(browser_family):
+    """Pick a random user-agent + viewport combo for a new context.
+
+    The UA family MUST match the launched engine. Mismatch (e.g. Chromium
+    engine announcing Firefox UA) is a strong anti-bot signal — SERFF's WAF
+    returns 403 in that case.
+    """
+    if browser_family == "webkit":
+        agents = _WEBKIT_USER_AGENTS
+    elif browser_family == "chromium":
+        agents = _CHROME_USER_AGENTS
+    else:
+        agents = _FIREFOX_USER_AGENTS
+    return random.choice(agents), random.choice(_VIEWPORTS)
 
 
 _FIREFOX_PREFS = {
@@ -184,26 +217,121 @@ _FIREFOX_PREFS = {
 }
 
 
-def _launch_browser(pw, headed=None):
-    """Launch Firefox with optional proxy and anti-detection prefs.
-    If headed is None, uses the global _headed_mode setting."""
+def _launch_browser(pw, headed=None, state_name=None):
+    """Launch preferred browser with optional proxy and anti-detection prefs.
+    If headed is None, uses the global _headed_mode setting.
+
+    Browser selection precedence (first wins):
+      1. SERFF_BROWSER_<STATE>  e.g. SERFF_BROWSER_CO=firefox
+      2. SERFF_BROWSER          (global override)
+      3. Platform default       (chromium on macOS, firefox elsewhere)
+    """
     if headed is None:
         headed = _headed_mode
-    kwargs = dict(
-        headless=not headed,
-        firefox_user_prefs=_FIREFOX_PREFS,
-    )
-    if PROXY_URL:
-        kwargs["proxy"] = {"server": PROXY_URL}
-    return pw.firefox.launch(**kwargs)
+    default_browser = "chromium" if sys.platform == "darwin" else "firefox"
+    per_state_env = None
+    if state_name:
+        per_state_env = os.environ.get(f"SERFF_BROWSER_{state_name.upper()}")
+    preferred = (
+        per_state_env or os.environ.get("SERFF_BROWSER") or default_browser
+    ).strip().lower()
+
+    def _launch_chromium():
+        chrome_channel = (os.environ.get("SERFF_CHROME_CHANNEL") or "chrome").strip()
+        kwargs = dict(
+            headless=not headed,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        if PROXY_URL:
+            kwargs["proxy"] = {"server": PROXY_URL}
+        if sys.platform == "linux":
+            kwargs["args"].extend(["--no-sandbox", "--disable-dev-shm-usage"])
+        if chrome_channel:
+            kwargs["channel"] = chrome_channel
+        try:
+            return pw.chromium.launch(**kwargs)
+        except Exception as e:
+            # If system Chrome channel is unavailable, fall back to bundled Chromium.
+            if kwargs.get("channel"):
+                channel_name = kwargs.pop("channel")
+                print(
+                    f"[BROWSER][WARN] Chromium channel '{channel_name}' unavailable: "
+                    f"{str(e).splitlines()[0]} — trying bundled Chromium."
+                )
+                return pw.chromium.launch(**kwargs)
+            raise
+
+    def _launch_firefox():
+        kwargs = dict(
+            headless=not headed,
+            firefox_user_prefs=_FIREFOX_PREFS,
+        )
+        if PROXY_URL:
+            kwargs["proxy"] = {"server": PROXY_URL}
+        return pw.firefox.launch(**kwargs)
+
+    def _launch_webkit():
+        kwargs = dict(
+            headless=not headed,
+        )
+        if PROXY_URL:
+            kwargs["proxy"] = {"server": PROXY_URL}
+        return pw.webkit.launch(**kwargs)
+
+    if preferred in ("webkit", "safari"):
+        try:
+            return _launch_webkit()
+        except Exception as e:
+            print(
+                f"[BROWSER][WARN] WebKit launch failed: {str(e).splitlines()[0]} "
+                f"— falling back to Chromium."
+            )
+            try:
+                return _launch_chromium()
+            except Exception as e2:
+                print(
+                    f"[BROWSER][WARN] Chromium fallback failed: {str(e2).splitlines()[0]} "
+                    f"— falling back to Firefox."
+                )
+                return _launch_firefox()
+
+    if preferred in ("chromium", "chrome"):
+        try:
+            return _launch_chromium()
+        except Exception as e:
+            print(
+                f"[BROWSER][WARN] Chromium launch failed: {str(e).splitlines()[0]} "
+                f"— falling back to Firefox."
+            )
+            return _launch_firefox()
+
+    try:
+        return _launch_firefox()
+    except Exception as e:
+        print(
+            f"[BROWSER][WARN] Firefox launch failed: {str(e).splitlines()[0]} "
+            f"— falling back to Chromium."
+        )
+        return _launch_chromium()
 
 
 def _new_stealth_context(browser):
-    """Create a new browser context with randomized anti-detection settings."""
-    ua, vp = _pick_identity()
-    context = browser.new_context(
+    """Create a new browser context with randomized anti-detection settings.
+
+    Set env var SERFF_NATIVE_UA=1 to skip the user_agent override entirely
+    and let the launched browser use its native UA + Client Hints. That is
+    the most authentic possible fingerprint (zero chance of UA/TLS/Sec-CH-UA
+    mismatch) and is recommended when launching real Chrome via channel='chrome'.
+    """
+    browser_family = "firefox"
+    try:
+        browser_family = browser.browser_type.name
+    except Exception:
+        pass
+    _, vp = _pick_identity(browser_family)
+    use_native_ua = os.environ.get("SERFF_NATIVE_UA", "").strip() in ("1", "true", "yes")
+    ctx_kwargs = dict(
         accept_downloads=True,
-        user_agent=ua,
         viewport=vp,
         locale="en-US",
         timezone_id="America/New_York",
@@ -211,7 +339,13 @@ def _new_stealth_context(browser):
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
-    context.add_init_script(_STEALTH_SCRIPT)
+    if not use_native_ua:
+        ua, _vp_ignored = _pick_identity(browser_family)
+        ctx_kwargs["user_agent"] = ua
+    context = browser.new_context(**ctx_kwargs)
+    context.add_init_script(_STEALTH_SCRIPT_COMMON)
+    if browser_family == "firefox":
+        context.add_init_script(_STEALTH_SCRIPT_FIREFOX)
     return context
 
 
@@ -222,12 +356,15 @@ def human_delay(low=0.5, high=2.0):
 
 def create_browser():
     """
-    Launch a **headless** Firefox instance with an isolated context.
+    Launch a browser instance with an isolated context.
     Returns (pw, browser, context, page).
-    Always headless — headed mode is only used for auth steps.
+
+    Honors the global headed flag (set via set_headed_mode); pass --headed at
+    the CLI to make every worker browser visible, or --headless (default in
+    most invocations) to keep it hidden.
     """
     pw = sync_playwright().start()
-    browser = _launch_browser(pw, headed=False)
+    browser = _launch_browser(pw, headed=None)  # None -> use _headed_mode
     context = _new_stealth_context(browser)
     page = context.new_page()
     return pw, browser, context, page
@@ -302,10 +439,7 @@ def _is_verification_screen_body(body_text):
     if not body_text:
         return False
     lower = body_text.lower()
-    return (
-        "confirm you are human" in lower
-        or "complete the security check" in lower
-    )
+    return "confirm you are human" in lower or "complete the security check" in lower
 
 
 def _headed_reauth_impl(state_name):
@@ -641,7 +775,7 @@ def create_http_session(context):
     session.cookies.update(extract_cookies(context))
     session.headers.update(
         {
-            "User-Agent": random.choice(_USER_AGENTS),
+            "User-Agent": random.choice(_FIREFOX_USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
@@ -660,16 +794,28 @@ def fetch_page(http_session, url, timeout=30):
     """
     Fetch a page via requests.  Much lighter than a full browser navigation.
     Returns (html, is_expired, is_server_error) or (None, True, False) on failure.
+
+    Notes on auth signalling:
+      - 401/403 are treated as `expired=True` so the caller falls back to the
+        browser re-auth + navigate path. SERFF occasionally returns 403 to
+        plain `requests` traffic while the same cookies still work in a real
+        browser session.
     """
     try:
         resp = http_session.get(url, timeout=timeout, allow_redirects=True)
         html = resp.text
         expired = (
-            "Begin Search" in html
+            resp.status_code in (401, 403)
+            or "Begin Search" in html
             or "userAgreement" in html
             or "Session Expired" in html
         )
         srv_err = resp.status_code >= 500 or "500.xhtml" in resp.url
+        if resp.status_code in (401, 403):
+            print(
+                f"[HTTP] {resp.status_code} on {url} — flagging session expired "
+                f"to force browser re-auth fallback"
+            )
         return html, expired, srv_err
     except _requests.RequestException as e:
         print(f"[HTTP] Request failed for {url}: {e}")
@@ -695,7 +841,7 @@ def create_http_session_from_cookies(cookies):
         session.cookies.update(cookies)
     session.headers.update(
         {
-            "User-Agent": random.choice(_USER_AGENTS),
+            "User-Agent": random.choice(_FIREFOX_USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
@@ -775,70 +921,65 @@ def pre_authenticate_all_states(states, headed=True):
     """
     mode = "headed" if headed else "headless"
     print(f"[PRE-AUTH] Authenticating {len(states)} states ({mode})...")
-    pw = sync_playwright().start()
-    browser = _launch_browser(pw, headed=headed)
     all_cookies = {}
+    for i, state in enumerate(states, 1):
+        print(f"[PRE-AUTH] ({i}/{len(states)}) {state}...", end=" ", flush=True)
+        pw = sync_playwright().start()
+        browser = _launch_browser(pw, headed=headed)
+        context = _new_stealth_context(browser)
+        page = context.new_page()
+        try:
+            # Quick auto-click attempt (2 retries — fast if no CAPTCHA)
+            ok = authenticate(page, state, max_retries=2)
+            if ok:
+                all_cookies[state] = context.cookies()
+                print(f"OK ({len(all_cookies[state])} cookies)")
+                continue
 
-    try:
-        for i, state in enumerate(states, 1):
-            print(f"[PRE-AUTH] ({i}/{len(states)}) {state}...", end=" ", flush=True)
+            if headed:
+                # Browser is visible — navigate fresh and let user solve CAPTCHA
+                auth_url = f"https://filingaccess.serff.com/sfa/home/{state}"
+                page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                print(
+                    f"\n[CAPTCHA] Solve verification in the browser for {state} (waiting up to {_CAPTCHA_WAIT}s)..."
+                )
+                deadline = time.time() + _CAPTCHA_WAIT
+                cookies = _poll_for_search_page(page, context, state, deadline)
+                if cookies:
+                    all_cookies[state] = cookies
+                    print(f"[CAPTCHA] {state} authenticated!")
+                    continue
+                print(f"[CAPTCHA] No response, falling back to backoff for {state}...")
+
+            # Backoff fallback — fresh context, more retries
+            try:
+                context.close()
+            except Exception:
+                pass
             context = _new_stealth_context(browser)
             page = context.new_page()
+            ok = authenticate(page, state)
+            if ok:
+                all_cookies[state] = context.cookies()
+                print(f"OK ({len(all_cookies[state])} cookies) [backoff]")
+            else:
+                print("FAILED")
+        except Exception as e:
+            print(f"ERROR: {str(e).splitlines()[0]}")
+        finally:
             try:
-                # Quick auto-click attempt (2 retries — fast if no CAPTCHA)
-                ok = authenticate(page, state, max_retries=2)
-                if ok:
-                    all_cookies[state] = context.cookies()
-                    print(f"OK ({len(all_cookies[state])} cookies)")
-                    continue
-
-                if headed:
-                    # Browser is visible — navigate fresh and let user solve CAPTCHA
-                    auth_url = f"https://filingaccess.serff.com/sfa/home/{state}"
-                    page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-                    print(
-                        f"\n[CAPTCHA] Solve verification in the browser for {state} (waiting up to {_CAPTCHA_WAIT}s)..."
-                    )
-                    deadline = time.time() + _CAPTCHA_WAIT
-                    cookies = _poll_for_search_page(page, context, state, deadline)
-                    if cookies:
-                        all_cookies[state] = cookies
-                        print(f"[CAPTCHA] {state} authenticated!")
-                        continue
-                    print(
-                        f"[CAPTCHA] No response, falling back to backoff for {state}..."
-                    )
-
-                # Backoff fallback — fresh context, more retries
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                context = _new_stealth_context(browser)
-                page = context.new_page()
-                ok = authenticate(page, state)
-                if ok:
-                    all_cookies[state] = context.cookies()
-                    print(f"OK ({len(all_cookies[state])} cookies) [backoff]")
-                else:
-                    print("FAILED")
-            except Exception as e:
-                print(f"ERROR: {str(e).splitlines()[0]}")
-            finally:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-            human_delay(1.0, 3.0)
-    finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                pw.stop()
+            except Exception:
+                pass
+        human_delay(1.0, 3.0)
 
     ok_count = len(all_cookies)
     fail_count = len(states) - ok_count
@@ -892,12 +1033,32 @@ def navigate_with_session_check(page, url, state_name, max_retries=3):
     return False
 
 
-def navigate_via_search(page, context, tracking_number, state_name):
+def navigate_via_search(
+    page, context, tracking_number, state_name, *, return_reason=False
+):
     """
     Navigate to a filing summary page by searching for the SERFF Tracking Number.
     Used for filings with alphanumeric IDs that can't be loaded via direct URL.
-    Returns True if the filing summary page loaded successfully, False otherwise.
+
+    Returns:
+      - default: True on success, False on any failure (backward compatible).
+      - if return_reason=True: (success: bool, reason: str). Reason is one of:
+          "ok"                      success
+          "server_error"            search page 500 (transient — worth retrying)
+          "search_page_unavailable" search input never attached (transient)
+          "search_button_failed"    couldn't click search button (transient)
+          "no_results"              search returned empty table (DETERMINISTIC —
+                                    do not retry with re-auth; the filing is
+                                    not in this state's SERFF instance)
+          "summary_load_failed"     clicked row but filing summary timed out
+                                    (transient)
     """
+
+    def _result(success, reason):
+        if return_reason:
+            return success, reason
+        return success
+
     search_url = "https://filingaccess.serff.com/sfa/search/filingSearch.xhtml"
     ensure_single_tab(context, page)
     page.goto(search_url, wait_until="domcontentloaded")
@@ -909,7 +1070,7 @@ def navigate_via_search(page, context, tracking_number, state_name):
         page.goto(search_url, wait_until="domcontentloaded")
         if is_server_error(page):
             print(f"[500] Search page still returning 500 after wait")
-            return False
+            return _result(False, "server_error")
 
     # Wait for search input
     input_locator = page.locator("#simpleSearch\\:serffTrackingNumber")
@@ -932,7 +1093,7 @@ def navigate_via_search(page, context, tracking_number, state_name):
             input_locator.wait_for(state="attached", timeout=15000)
         except PlaywrightTimeout:
             print(f"[ERROR] Search page still not available after re-auth")
-            return False
+            return _result(False, "search_page_unavailable")
 
     input_locator.fill(str(tracking_number))
     human_delay(0.5, 1.5)
@@ -942,7 +1103,7 @@ def navigate_via_search(page, context, tracking_number, state_name):
         page.locator("#simpleSearch\\:saveBtn").click(timeout=15000)
     except Exception:
         print(f"[ERROR] Could not click search button for {tracking_number}")
-        return False
+        return _result(False, "search_button_failed")
 
     human_delay(1.0, 2.5)
 
@@ -955,7 +1116,7 @@ def navigate_via_search(page, context, tracking_number, state_name):
             pass
     except Exception:
         print(f"[ERROR] No search results found for {tracking_number}")
-        return False
+        return _result(False, "no_results")
 
     # Wait for the filing summary page to load
     try:
@@ -964,10 +1125,10 @@ def navigate_via_search(page, context, tracking_number, state_name):
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
             pass
-        return True
+        return _result(True, "ok")
     except Exception:
         print(f"[WARN] Filing summary page did not load for {tracking_number}")
-        return False
+        return _result(False, "summary_load_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1155,9 +1316,7 @@ def _download_zip_naic_on_page(
         if rows_match.count() > 0:
             result_link = rows_match.first.locator("a.LinkedItem---richtext_link")
         else:
-            result_link = page.locator(
-                "tbody tr a.LinkedItem---richtext_link"
-            ).first
+            result_link = page.locator("tbody tr a.LinkedItem---richtext_link").first
         result_link.wait_for(state="visible", timeout=45_000)
         result_link.click(timeout=15_000)
         human_delay(1.0, 2.0)
@@ -1218,7 +1377,10 @@ def _download_zip_naic_on_page(
     finally:
         if os.path.exists(temp_zip):
             try:
-                if not os.path.exists(zip_file_path) or os.path.getsize(zip_file_path) == 0:
+                if (
+                    not os.path.exists(zip_file_path)
+                    or os.path.getsize(zip_file_path) == 0
+                ):
                     pass  # leave .part for debugging
                 else:
                     os.remove(temp_zip)
@@ -1280,9 +1442,7 @@ def download_zip_via_naic_portal(
             headless = not _headed_mode
             ch_args = ["--disable-blink-features=AutomationControlled"]
             if sys.platform == "linux":
-                ch_args.extend(
-                    ["--no-sandbox", "--disable-dev-shm-usage"]
-                )
+                ch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
             cleanup_browser = pw.chromium.launch(
                 headless=headless, channel=channel, args=ch_args
             )
@@ -1294,7 +1454,7 @@ def download_zip_via_naic_portal(
             if path_storage:
                 ctx_kw["storage_state"] = path_storage
             cleanup_ctx = cleanup_browser.new_context(**ctx_kw)
-            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT_COMMON)
             naic_page = cleanup_ctx.new_page()
         elif path_storage:
             browser = page.context.browser
@@ -1305,7 +1465,12 @@ def download_zip_via_naic_portal(
                 locale="en-US",
                 viewport=vp or {"width": 1280, "height": 720},
             )
-            cleanup_ctx.add_init_script(_STEALTH_SCRIPT)
+            cleanup_ctx.add_init_script(_STEALTH_SCRIPT_COMMON)
+            try:
+                if browser.browser_type.name == "firefox":
+                    cleanup_ctx.add_init_script(_STEALTH_SCRIPT_FIREFOX)
+            except Exception:
+                pass
             naic_page = cleanup_ctx.new_page()
 
         return _download_zip_naic_on_page(
